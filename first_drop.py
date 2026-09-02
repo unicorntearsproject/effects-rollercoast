@@ -69,6 +69,7 @@ out vec4 fragColor;
 #define PI  3.14159265
 #define TAU 6.28318530
 #define STEPS 56
+#define MIDWAY vec3(0.35, 0.85, 1.00)
 
 float hash21(vec2 p) {
     p = mod(p, 512.0);
@@ -102,8 +103,8 @@ float rideHeight(float s) {
 
 // Lateral wander: a couple of bounded sines, seeded per activation.
 float rideLateral(float s) {
-    float a = sin(s * 0.0125 + iSeed * 6.3) * 16.0;
-    float b = sin(s * 0.0067 + iSeed * 2.1 + 1.3) * 26.0;
+    float a = sin(s * 0.0125 + iSeed * 6.3) * 6.5;
+    float b = sin(s * 0.0067 + iSeed * 2.1 + 1.3) * 11.0;
     return a + b;
 }
 
@@ -114,17 +115,18 @@ struct Cam { vec3 pos; vec3 right; vec3 up; vec3 fwd; };
 
 Cam rideCam(float s, float shake) {
     Cam c;
-    vec3 p0 = trackPoint(s - 1.0);
-    vec3 p1 = trackPoint(s + 1.0);
-    c.fwd = normalize(p1 - p0);
+    vec3 here = trackPoint(s);
+    vec3 tangent = normalize(trackPoint(s + 1.0) - trackPoint(s - 1.0));
+    // Look where the track is going, not just where it points right now.
+    c.fwd = normalize(mix(tangent, normalize(trackPoint(s + 20.0) - here), 0.55));
     // Bank into the turn: roll from how fast the lateral offset is changing.
     float dl = (rideLateral(s + 6.0) - rideLateral(s - 6.0)) / 12.0;
-    float roll = clamp(dl * 1.5, -1.0, 1.0) * 0.9;
+    float roll = clamp(dl * 1.8, -1.0, 1.0) * 0.42;
     vec3 worldUp = vec3(sin(roll), cos(roll), 0.0);
     c.right = normalize(cross(c.fwd, worldUp));
     c.up = cross(c.right, c.fwd);
     // Seat is above the rails; shake rides the bass and the beat.
-    c.pos = trackPoint(s) + c.up * 1.9
+    c.pos = here + c.up * 1.9
           + c.right * shake * 0.25 + c.up * shake * 0.18;
     return c;
 }
@@ -174,10 +176,26 @@ void main() {
     Cam cam = rideCam(iTravel, shake);
     vec3 col = skyColour(p, tb);
 
-    // Ground haze under the horizon, so the drop has something to fall into.
-    float horizon = -iGrade * 0.9;
-    col = mix(col, mix(vec3(0.05, 0.06, 0.10), palette(iHue + 0.55), 0.30),
-              smoothstep(horizon + 0.02, horizon - 0.35, p.y) * 0.85);
+    // Real ground plane: intersect the view ray with y=0 so the park has
+    // actual perspective under the ride instead of a flat wash of haze.
+    vec3 rd = normalize(cam.fwd + p.x * cam.right + p.y * cam.up);
+    if (rd.y < -0.0015 && cam.pos.y > 0.2) {
+        float td = -cam.pos.y / rd.y;
+        if (td > 0.0 && td < 900.0) {
+            vec3 g = cam.pos + rd * td;
+            vec2 cell = abs(fract(g.xz * 0.06) - 0.5);
+            float line = smoothstep(0.045, 0.0, min(cell.x, cell.y));
+            vec3 gnd = mix(vec3(0.030, 0.035, 0.055), palette(iHue + 0.55), 0.25);
+            gnd += mix(MIDWAY, palette(iHue + 0.2), 0.35) * line * (0.35 + iBass * 0.5);
+            // Midway lights scattered across the park.
+            float lamp = hash21(floor(g.xz * 0.09));
+            gnd += mix(vec3(1.0, 0.80, 0.45), palette(iHue + 0.1), 0.3)
+                 * step(0.972, lamp)
+                 * smoothstep(0.42, 0.0, length(fract(g.xz * 0.09) - 0.5))
+                 * (0.8 + iTreble * 1.2);
+            col = mix(col, gnd, exp(-td * 0.0045));
+        }
+    }
 
     // ── march the track far -> near so crests occlude what is beyond ────────
     vec3 railCol = mix(vec3(0.85, 0.90, 1.00), palette(iHue + 0.15), 0.45);
@@ -193,7 +211,7 @@ void main() {
 
         // Bank the rail pair with the local roll so the gauge tilts in turns.
         float dl = (rideLateral(s0 + 6.0) - rideLateral(s0 - 6.0)) / 12.0;
-        float roll = clamp(dl * 1.5, -1.0, 1.0) * 0.9;
+        float roll = clamp(dl * 1.8, -1.0, 1.0) * 0.42;
         vec3 lat = vec3(cos(roll), sin(roll), 0.0);
         vec3 nrm = vec3(-sin(roll), cos(roll), 0.0);
 
@@ -233,10 +251,20 @@ void main() {
         }
     }
 
-    // Wind streaks past the camera, denser the faster you are going.
-    float sp = hash21(floor(vec2(p.x * 90.0, p.y * 26.0 + tb * 40.0)));
-    col += vec3(0.9, 0.95, 1.0) * step(0.985 - iBass * 0.02, sp)
-         * (0.25 + iTreble * 0.8) * iGlitter * smoothstep(0.1, 0.6, abs(p.x));
+    // Speed lines: thin streaks radiating out of the vanishing point, so the
+    // rush reads as motion rather than as a field of blocky confetti.
+    float ang = atan(p.y, p.x);
+    float rad = length(p);
+    float lane = floor(ang / TAU * 96.0);
+    float lh = hash21(vec2(lane, 7.0));
+    float ph = fract(lh + iTravel * 0.02);
+    float along = fract(rad * 1.6 - ph * 2.0);
+    float across = abs(fract(ang / TAU * 96.0) - 0.5) * 2.0;
+    float streak = smoothstep(0.22, 0.0, across)
+                 * smoothstep(0.55, 0.92, along) * smoothstep(1.0, 0.93, along);
+    col += vec3(0.85, 0.93, 1.0) * streak * step(0.55, lh)
+         * smoothstep(0.18, 0.75, rad) * (0.30 + iTreble * 0.9 + iBass * 0.5)
+         * iGlitter;
 
     col += palette(iHue + 0.5) * iBeat * 0.12;
     col *= smoothstep(1.5, 0.22, length(v_uv - 0.5));
