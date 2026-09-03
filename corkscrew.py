@@ -1,36 +1,45 @@
-"""Corkscrew — barrel-rolling through an inversion, ridden first-person.
+"""Corkscrew — barrel-rolling through inversions on a closed circuit.
 
-Built on the same real 3-D track curve as the rest of the pack: the camera sits
-on the curve, oriented by its tangent and rolled by the geometry.  What makes
-this one is the roll — the track spirals, so the horizon rotates right through
-the vertical and keeps going, and because the rail pair is banked by the *same*
-roll the whole structure corkscrews around the rider instead of the image
-merely spinning.
+Same closed-loop track and energy-conserving physics as the rest of the pack,
+with the roll doing the work.  The 1.x version had a real bug here: its roll
+added an ever-growing counter, so within a couple of minutes the ride was
+parked at thousands of degrees of permanent rotation and the "corkscrew" was
+just a crooked horizon.  The roll is now a pure function of position on the
+lap — two full turns at fixed points on the circuit — so it is periodic by
+construction, cannot drift, and puts the inversions in the same place every
+lap the way a real ride does.
 
-Inversions are not continuous: the ride runs level, winds into a spiral, snaps
-through it, then settles.  The spiral windows are seeded per activation, so
-where they land on the circuit changes every run.
+Because the rail pair is banked by the same roll as the camera, the structure
+corkscrews around the rider rather than the picture simply spinning.
 
 Audio reactivity:
-  - bass    -> roll rate through an inversion, speed, rail glow
+  - bass    -> speed, camera shake, rail glow
   - mid     -> palette drift, sky banding
   - treble  -> rail sparkle, speed-line density
-  - beat    -> flash, roll kick, sky burst
+  - beat    -> flash, kick, sky burst
 
 Randomised per activation: palette hue, position on the circuit, track seed,
-sky variant, spiral phase, and ``self.time``.
+sky variant, and ``self.time``.
 
 Config keys (under ``[effects.Corkscrew]``):
     speed, zoom, reactivity, glitter, roll_force
 """
 from __future__ import annotations
 
+import math
+
 import moderngl
 import numpy as np
 
 from unicornviz.effects.base import AudioData, BaseEffect
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
+
+# One lap, in metres. Shared by the shader and the CPU physics.
+CIRCUIT = 900.0
+# Crest of the ride; the energy model measures every fall from just above it.
+H_TOP = 68.0
+GRAVITY = 9.81
 
 _VERT = """
 #version 330
@@ -54,19 +63,19 @@ uniform float iPunch;
 uniform float iHue;
 uniform float iZoom;
 uniform float iGlitter;
-uniform float iTravel;     // CPU-integrated distance along the ride
-uniform float iSeed;       // per-activation track shape
+uniform float iTravel;     // position on the lap, always within [0, CIRCUIT)
+uniform float iSeed;       // per-activation plan shape of the loop
 uniform float iSky;        // per-activation sky variant
 uniform float iRollForce;  // tweakable: how hard the inversions bite
-uniform float iSpin;       // CPU-integrated corkscrew roll
-uniform float iGrade;      // current track gradient (drives the horizon)
+uniform float iGrade;      // current track gradient, tilts the horizon
 in  vec2 v_uv;
 out vec4 fragColor;
 
 #define PI  3.14159265
 #define TAU 6.28318530
-#define STEPS 56
-#define MIDWAY vec3(0.35, 0.85, 1.00)
+#define STEPS 46
+#define CIRCUIT 900.0
+#define LAP_R 168.0
 
 float hash21(vec2 p) {
     p = mod(p, 512.0);
@@ -76,62 +85,67 @@ float hash21(vec2 p) {
 }
 vec3 palette(float t) { return 0.5 + 0.5 * cos(TAU * (t + vec3(0.0, 0.33, 0.67))); }
 
-// ── the ride profile ────────────────────────────────────────────────────────
-// One circuit is CIRCUIT metres: a chain lift, a crest, the drop, then a run
-// of camelbacks that decay back to station height.
-const float CIRCUIT = 620.0;
-
+// ── the circuit ─────────────────────────────────────────────────────────────
+// Height as a function of lap fraction. Every branch meets its neighbour, and
+// the last value equals the first, so there is no step at the lap seam -- the
+// 1.x profile jumped 4m there and spiked the speed integrator once per lap.
 float rideHeight(float s) {
-    float u = mod(s, CIRCUIT) / CIRCUIT;
-    // A lift, then swooping helices at a held altitude -- an inversion needs
-    // height kept, not spent, so this profile does not dump it in one drop.
-    float lift = smoothstep(0.0, 0.26, u) * 44.0;
-    float swoop = sin(u * TAU * 3.0 + iSeed * 4.0) * 11.0
-                + sin(u * TAU * 5.0 + 1.1) * 5.0;
-    return 8.0 + lift + swoop * smoothstep(0.20, 0.34, u);
-}
-
-// Lateral wander: a couple of bounded sines, seeded per activation.
-float rideLateral(float s) {
-    float a = sin(s * 0.0125 + iSeed * 6.3) * 6.5;
-    float b = sin(s * 0.0067 + iSeed * 2.1 + 1.3) * 11.0;
-    return a + b;
-}
-
-vec3 trackPoint(float s) { return vec3(rideLateral(s), rideHeight(s), s); }
-
-// Corkscrew roll: level, hard spiral, level again. Two windows per circuit,
-// offset by the seed, so inversions land somewhere different each run.
-float spiralRoll(float s) {
-    float u = fract(s / CIRCUIT + iSeed * 0.37);
-    float r = 0.0;
-    for (int i = 0; i < 2; i++) {
-        float c = 0.30 + float(i) * 0.38;
-        float d = (u - c) / 0.13;
-        float w = exp(-d * d * 2.2);
-        r += w * (d * 0.5 + 0.5) * TAU * (1.0 + float(i));
+    float u = fract(s / CIRCUIT);
+    if (u < 0.06) return 3.0;                                        // station
+    if (u < 0.34) return 3.0 + smoothstep(0.06, 0.34, u) * 62.0;     // chain lift
+    if (u < 0.40) return 65.0 - smoothstep(0.34, 0.40, u) * 3.0;     // crest
+    if (u < 0.46) {                                   // drop into the first roll
+        float d = smoothstep(0.40, 0.46, u);
+        return 62.0 - d * d * 30.0;
     }
-    return r * iRollForce + iSpin * 0.15;
+    if (u < 0.90) {                     // inversions run at a held altitude
+        float d = (u - 0.46) / 0.44;
+        return 32.0 - d * 24.0 + 7.0 * (0.5 - 0.5 * cos(d * 11.0));
+    }
+    return mix(8.0, 3.0, smoothstep(0.90, 1.0, u));                  // brake run
 }
 
-// ── camera ──────────────────────────────────────────────────────────────────
+// The loop's plan shape: a closed curve, so every coordinate stays bounded no
+// matter how many laps have been run.
+vec3 trackPoint(float s) {
+    float th = fract(s / CIRCUIT) * TAU;
+    float r = LAP_R * (1.0 + 0.20 * sin(th * 2.0 + iSeed * 6.3)
+                           + 0.09 * sin(th * 3.0 + 1.9));
+    return vec3(r * sin(th), rideHeight(s), r * cos(th));
+}
+
+// Bank into the turn from the actual plan curvature, not from a sine.
+float trackRoll(float s) {
+    vec3 a = trackPoint(s - 9.0), b = trackPoint(s), c = trackPoint(s + 9.0);
+    vec2 d1 = normalize(b.xz - a.xz), d2 = normalize(c.xz - b.xz);
+    float turn = d1.x * d2.y - d1.y * d2.x;
+    float bank = clamp(turn * 11.0, -1.0, 1.0) * 0.62;
+
+    // The corkscrews: two full turns at fixed points on the lap. This is a
+    // pure function of lap fraction, so it is periodic by construction and
+    // cannot accumulate -- the 1.x version added a free-running counter here
+    // and drifted to thousands of degrees of permanent roll within minutes.
+    float u = fract(s / CIRCUIT);
+    float spiral = 0.0;
+    for (int i = 0; i < 2; i++) {
+        float c0 = 0.44 + float(i) * 0.24;
+        spiral += smoothstep(-1.0, 1.0, (u - c0) / 0.070) * TAU;
+    }
+    return bank + spiral * iRollForce;
+}
+
 struct Cam { vec3 pos; vec3 right; vec3 up; vec3 fwd; };
 
 Cam rideCam(float s, float shake) {
     Cam c;
     vec3 here = trackPoint(s);
-    vec3 tangent = normalize(trackPoint(s + 1.0) - trackPoint(s - 1.0));
-    // Look where the track is going, not just where it points right now.
-    c.fwd = normalize(mix(tangent, normalize(trackPoint(s + 20.0) - here), 0.55));
-    // Bank into the turn: roll from how fast the lateral offset is changing.
-    float dl = (rideLateral(s + 6.0) - rideLateral(s - 6.0)) / 12.0;
-    float roll = clamp(dl * 1.8, -1.0, 1.0) * 0.42 + spiralRoll(s);
+    vec3 tangent = normalize(trackPoint(s + 1.5) - trackPoint(s - 1.5));
+    c.fwd = normalize(mix(tangent, normalize(trackPoint(s + 22.0) - here), 0.5));
+    float roll = trackRoll(s);
     vec3 worldUp = vec3(sin(roll), cos(roll), 0.0);
     c.right = normalize(cross(c.fwd, worldUp));
     c.up = cross(c.right, c.fwd);
-    // Seat is above the rails; shake rides the bass and the beat.
-    c.pos = here + c.up * 1.9
-          + c.right * shake * 0.25 + c.up * shake * 0.18;
+    c.pos = here + c.up * 1.9 + c.right * shake * 0.25 + c.up * shake * 0.18;
     return c;
 }
 
@@ -143,14 +157,33 @@ bool project(Cam c, vec3 P, out vec2 sp, out float depth) {
     depth = z;
     return true;
 }
-
 float segDist(vec2 p, vec2 a, vec2 b) {
     vec2 pa = p - a, ba = b - a;
     float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
     return length(pa - ba * h);
 }
 
-// ── sky + ground ────────────────────────────────────────────────────────────
+// One structural member, drawn with depth-correct thickness.
+void strut(inout vec3 col, Cam cam, vec2 p, vec3 A, vec3 B,
+           float radius, vec3 c, float glow) {
+    vec2 a, b; float da, db;
+    if (!project(cam, A, a, da)) return;
+    if (!project(cam, B, b, db)) return;
+    float w = clamp(radius / min(da, db), 0.0007, 0.09);
+    float d = segDist(p, a, b);
+    col = mix(col, c, smoothstep(w, w * 0.45, d));
+    if (glow > 0.0) col += c * smoothstep(w * 0.55, 0.0, d) * glow;
+}
+
+// Local frame at s: lateral and normal, both banked with the track.
+void frameAt(float s, out vec3 lat, out vec3 nrm) {
+    float roll = trackRoll(s);
+    vec3 tangent = normalize(trackPoint(s + 1.5) - trackPoint(s - 1.5));
+    vec3 worldUp = vec3(sin(roll), cos(roll), 0.0);
+    lat = normalize(cross(tangent, worldUp));
+    nrm = cross(lat, tangent);
+}
+
 vec3 skyColour(vec2 p, float tb) {
     float up = clamp(p.y * 0.9 + 0.35 - iGrade * 0.35, 0.0, 1.0);
     vec3 lo, hi;
@@ -159,11 +192,9 @@ vec3 skyColour(vec2 p, float tb) {
     else                  { lo = vec3(0.60, 0.10, 0.55); hi = vec3(0.03, 0.05, 0.20); }
     vec3 col = mix(lo, hi, pow(up, 0.75));
     col = mix(col, palette(iHue + up * 0.3), 0.22 + iMid * 0.10);
-    // Banded cloud deck.
     float band = sin(p.y * 22.0 - tb * 0.25 + sin(p.x * 2.0) * 1.2);
     col += vec3(1.0, 0.85, 0.75) * smoothstep(0.90, 1.0, band)
          * (0.10 + iMid * 0.20) * (1.0 - up);
-    // Sun.
     vec2 sunP = vec2(0.30, 0.10 - iGrade * 0.5);
     col += mix(vec3(1.0, 0.75, 0.35), palette(iHue + 0.1), 0.35)
          * exp(-length(p - sunP) * 5.0) * (0.9 + iBass * 0.7);
@@ -180,8 +211,6 @@ void main() {
     Cam cam = rideCam(iTravel, shake);
     vec3 col = skyColour(p, tb);
 
-    // Real ground plane: intersect the view ray with y=0 so the park has
-    // actual perspective under the ride instead of a flat wash of haze.
     vec3 rd = normalize(cam.fwd + p.x * cam.right + p.y * cam.up);
     if (rd.y < -0.0015 && cam.pos.y > 0.2) {
         float td = -cam.pos.y / rd.y;
@@ -190,21 +219,22 @@ void main() {
             vec2 cell = abs(fract(g.xz * 0.06) - 0.5);
             float line = smoothstep(0.045, 0.0, min(cell.x, cell.y));
             vec3 gnd = mix(vec3(0.030, 0.035, 0.055), palette(iHue + 0.55), 0.25);
-            gnd += mix(MIDWAY, palette(iHue + 0.2), 0.35) * line * (0.35 + iBass * 0.5);
-            // Midway lights scattered across the park.
-            float lamp = hash21(floor(g.xz * 0.09));
+            gnd += mix(vec3(0.35, 0.85, 1.0), palette(iHue + 0.2), 0.35)
+                 * line * (0.35 + iBass * 0.5);
+            float lamp = hash21(floor(g.xz * 0.10));
             gnd += mix(vec3(1.0, 0.80, 0.45), palette(iHue + 0.1), 0.3)
-                 * step(0.972, lamp)
-                 * smoothstep(0.42, 0.0, length(fract(g.xz * 0.09) - 0.5))
+                 * step(0.965, lamp)
+                 * smoothstep(0.42, 0.0, length(fract(g.xz * 0.10) - 0.5))
                  * (0.8 + iTreble * 1.2);
             col = mix(col, gnd, exp(-td * 0.0045));
         }
     }
 
-    // ── march the track far -> near so crests occlude what is beyond ────────
-    vec3 railCol = mix(vec3(0.85, 0.90, 1.00), palette(iHue + 0.15), 0.45);
-    vec3 tieCol  = mix(vec3(0.35, 0.22, 0.14), palette(iHue + 0.6), 0.30);
-    const float NEAR = 2.0, FAR = 300.0, GAUGE = 1.5;
+    // ── the structure, marched far to near so crests occlude what is beyond ──
+    vec3 railCol  = mix(vec3(0.85, 0.90, 1.00), palette(iHue + 0.15), 0.45);
+    vec3 spineCol = mix(vec3(0.16, 0.18, 0.24), palette(iHue + 0.45), 0.30);
+    vec3 tieCol   = mix(vec3(0.40, 0.26, 0.16), palette(iHue + 0.60), 0.28);
+    const float NEAR = 2.0, FAR = 430.0, GAUGE = 1.6, SPINE = 2.1;
 
     for (int i = STEPS - 1; i >= 0; i--) {
         float f0 = float(i) / float(STEPS);
@@ -212,51 +242,59 @@ void main() {
         float s0 = iTravel + NEAR + f0 * f0 * FAR;
         float s1 = iTravel + NEAR + f1 * f1 * FAR;
         vec3 c0 = trackPoint(s0), c1 = trackPoint(s1);
+        vec3 lat0, nrm0, lat1, nrm1;
+        frameAt(s0, lat0, nrm0);
+        frameAt(s1, lat1, nrm1);
+        float fade = 1.0 - f0 * 0.75;
+        float glow = (0.30 + iTreble * 0.9) * fade;
 
-        // Bank the rail pair with the local roll so the gauge tilts in turns.
-        float dl = (rideLateral(s0 + 6.0) - rideLateral(s0 - 6.0)) / 12.0;
-        float roll = clamp(dl * 1.8, -1.0, 1.0) * 0.42 + spiralRoll(s0);
-        vec3 lat = vec3(cos(roll), sin(roll), 0.0);
-        vec3 nrm = vec3(-sin(roll), cos(roll), 0.0);
+        // Box spine under the rails: two chords, so the track has depth.
+        strut(col, cam, p, c0 - nrm0 * SPINE - lat0 * 0.5,
+                          c1 - nrm1 * SPINE - lat1 * 0.5, 0.20, spineCol * fade, 0.0);
+        strut(col, cam, p, c0 - nrm0 * SPINE + lat0 * 0.5,
+                          c1 - nrm1 * SPINE + lat1 * 0.5, 0.20, spineCol * fade, 0.0);
 
-        float fade = 1.0 - f0;
+        // Zig-zag truss lacing tying the spine to the rails. Near steps only --
+        // at distance it collapses into noise and costs the same to draw.
+        if (f0 < 0.42) {
+            float zig = mod(floor(s0 * 0.5), 2.0) < 1.0 ? -1.0 : 1.0;
+            strut(col, cam, p, c0 - nrm0 * SPINE + lat0 * (0.5 * zig),
+                              c1 + lat1 * (GAUGE * zig), 0.11, spineCol * 0.95 * fade, 0.0);
+        }
+
+        // Cross ties.
+        if (mod(floor(s0 * 0.55), 1.0) < 0.5) {
+            strut(col, cam, p, c0 - lat0 * GAUGE * 1.25, c0 + lat0 * GAUGE * 1.25,
+                  0.13, tieCol * (0.4 + fade * 0.7), 0.0);
+        }
+
+        // The running rails, drawn last so they sit on top of the structure.
         for (int r = -1; r <= 1; r += 2) {
-            vec2 a, b; float da, db;
-            if (!project(cam, c0 + lat * (GAUGE * float(r)), a, da)) continue;
-            if (!project(cam, c1 + lat * (GAUGE * float(r)), b, db)) continue;
-            float w = clamp(0.16 / da, 0.0015, 0.05);
-            float d = segDist(p, a, b);
-            float m = smoothstep(w, w * 0.35, d);
-            vec3 c = railCol * (0.45 + fade * 0.9 + iBass * 0.35);
-            col = mix(col, c, m);
-            // Hot specular running along the rail head.
-            col += railCol * smoothstep(w * 0.5, 0.0, d) * (0.35 + iTreble * 1.1) * fade;
+            strut(col, cam, p, c0 + lat0 * (GAUGE * float(r)),
+                              c1 + lat1 * (GAUGE * float(r)),
+                  0.17, railCol * (0.45 + fade * 0.85 + iBass * 0.35), glow);
         }
-        // Sleepers every few metres.
-        if (mod(floor(s0 * 0.5), 1.0) < 0.5) {
-            vec2 a, b; float da, db;
-            if (project(cam, c0 - lat * GAUGE * 1.25, a, da)
-                && project(cam, c0 + lat * GAUGE * 1.25, b, db)) {
-                float w = clamp(0.10 / da, 0.001, 0.03);
-                col = mix(col, tieCol * (0.35 + fade * 0.7),
-                          smoothstep(w, w * 0.4, segDist(p, a, b)));
-            }
-        }
-        // Support columns dropping to the ground.
-        if (mod(floor(s0 * 0.125), 1.0) < 0.5 && c0.y > 3.0) {
-            vec2 a, b; float da, db;
-            if (project(cam, c0 - nrm * 1.0, a, da)
-                && project(cam, vec3(c0.x, 0.0, c0.z), b, db)) {
-                float w = clamp(0.09 / da, 0.001, 0.03);
-                col = mix(col, mix(vec3(0.18, 0.20, 0.26), palette(iHue + 0.4), 0.3)
-                               * (0.3 + fade * 0.6),
-                          smoothstep(w, w * 0.4, segDist(p, a, b)) * 0.85);
-            }
+
+        // Support bents: paired legs, a cross brace and footers.
+        if (mod(floor(s0 * 0.0714), 1.0) < 0.5 && c0.y > 4.0) {
+            vec3 baseL = vec3((c0 - lat0 * 2.6).x, 0.0, (c0 - lat0 * 2.6).z);
+            vec3 baseR = vec3((c0 + lat0 * 2.6).x, 0.0, (c0 + lat0 * 2.6).z);
+            vec3 topL = c0 - nrm0 * SPINE - lat0 * 0.9;
+            vec3 topR = c0 - nrm0 * SPINE + lat0 * 0.9;
+            vec3 legCol = mix(vec3(0.20, 0.22, 0.28), palette(iHue + 0.4), 0.30) * fade;
+            strut(col, cam, p, topL, baseL, 0.17, legCol, 0.0);
+            strut(col, cam, p, topR, baseR, 0.17, legCol, 0.0);
+            // Cross bracing, and a horizontal tie halfway down.
+            vec3 midL = mix(topL, baseL, 0.5), midR = mix(topR, baseR, 0.5);
+            strut(col, cam, p, topL, midR, 0.10, legCol * 0.9, 0.0);
+            strut(col, cam, p, topR, midL, 0.10, legCol * 0.9, 0.0);
+            strut(col, cam, p, midL, midR, 0.10, legCol * 0.9, 0.0);
+            strut(col, cam, p, midL, baseR, 0.09, legCol * 0.85, 0.0);
+            strut(col, cam, p, midR, baseL, 0.09, legCol * 0.85, 0.0);
         }
     }
 
-    // Speed lines: thin streaks radiating out of the vanishing point, so the
-    // rush reads as motion rather than as a field of blocky confetti.
+    // Speed lines radiating from the vanishing point.
     float ang = atan(p.y, p.x);
     float rad = length(p);
     float lane = floor(ang / TAU * 96.0);
@@ -279,18 +317,47 @@ void main() {
 """
 
 
+def _smoothstep(a: float, b: float, x: float) -> float:
+    t = min(1.0, max(0.0, (x - a) / max(b - a, 1e-6)))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def ride_height(s: float) -> float:
+    """CPU mirror of the shader's rideHeight, for the physics integrator."""
+    u = (s / CIRCUIT) % 1.0
+    if u < 0.06:
+        return 3.0
+    if u < 0.34:
+        return 3.0 + _smoothstep(0.06, 0.34, u) * 62.0
+    if u < 0.40:
+        return 65.0 - _smoothstep(0.34, 0.40, u) * 3.0
+    if u < 0.46:
+        d = _smoothstep(0.40, 0.46, u)
+        return 62.0 - d * d * 30.0
+    if u < 0.90:
+        d = (u - 0.46) / 0.44
+        return 32.0 - d * 24.0 + 7.0 * (0.5 - 0.5 * math.cos(d * 11.0))
+    return 8.0 + (3.0 - 8.0) * _smoothstep(0.90, 1.0, u)
+
+
+def on_lift(s: float) -> bool:
+    """True while the chain has hold of the train."""
+    return ((s / CIRCUIT) % 1.0) < 0.34
+
+
 class Corkscrew(BaseEffect):
-    """First-person barrel roll through corkscrew inversions."""
+    """First-person barrel rolls through inversions on a closed circuit."""
 
     NAME = 'Corkscrew'
     AUTHOR = 'unicorn-viz'
     TAGS = ['rollercoast', 'ride', 'neon', 'intense', 'energetic', 'hard']
     PING_PONG_FRIENDS = [
         'First Drop', 'Night Coaster', 'Mine Train', 'Coaster Cam',
-        'Warp Drive', 'Canyon Run', 'Audio Spectrum',
+        'Demon Drop', 'Log Flume', 'Audio Spectrum',
     ]
 
-    _CIRCUIT = 620.0
+    _LIFT_SPEED = 9.0        # m/s, chain speed
+    _MIN_SPEED = 5.0         # m/s, so a crest never stalls the ride
 
     def _init(self) -> None:
         self.parameters = {
@@ -309,25 +376,11 @@ class Corkscrew(BaseEffect):
         self._hue = float(self.rng.uniform(0.0, 1.0))
         self._seed = float(self.rng.uniform(0.0, 1.0))
         self._sky = float(self.rng.uniform(0.0, 1.0))
-        self._travel = float(self.rng.uniform(0.0, self._CIRCUIT))
+        self._travel = float(self.rng.uniform(0.0, CIRCUIT))
         self._grade = 0.0
-        self._spin = float(self.rng.uniform(0.0, 100.0))
-
-    def _height(self, s: float) -> float:
-        """Mirror of the shader's rideHeight, so the CPU can read the gradient."""
-        u = (s % self._CIRCUIT) / self._CIRCUIT
-        if u < 0.34:
-            return _smoothstep(0.0, 0.34, u) * 62.0
-        if u < 0.40:
-            return 62.0 - _smoothstep(0.34, 0.40, u) * 3.0
-        if u < 0.52:
-            d = _smoothstep(0.40, 0.52, u)
-            return 59.0 - d * d * 55.0
-        d = (u - 0.52) / 0.48
-        return 4.0 + (1.0 - d) * 22.0 * (0.5 + 0.5 * float(np.cos(d * 14.0)))
 
     def update(self, dt: float, audio: AudioData) -> None:
-        """Advance the train along the ride and track the audio envelopes."""
+        """Advance the train by conserving energy, and track the audio."""
         super().update(dt, audio)
         react = max(0.05, float(self.parameters['reactivity']))
         self._bass = float(np.clip(audio.bass_n * react, 0.0, 2.0))
@@ -339,20 +392,24 @@ class Corkscrew(BaseEffect):
         self._beat = max(0.0, self._beat - dt * 5.0)
         self._punch = max(0.0, self._punch - dt * 2.2)
 
-        # Gradient of the ride at the train, used both to speed it up going
-        # downhill and to tilt the horizon in the shader.
-        ahead = 4.0
-        grade = (self._height(self._travel + ahead) - self._height(self._travel - ahead)) / (2 * ahead)
-        self._grade = float(np.clip(grade, -1.5, 1.5))
+        h = ride_height(self._travel)
+        ahead = 5.0
+        self._grade = float(np.clip(
+            (ride_height(self._travel + ahead) - ride_height(self._travel - ahead))
+            / (2 * ahead), -1.5, 1.5))
+
+        # Energy conservation: everything the train has, it got by falling.
+        # On the lift the chain sets the pace instead.
+        if on_lift(self._travel):
+            v = self._LIFT_SPEED
+        else:
+            v = math.sqrt(max(0.0, 2.0 * GRAVITY * max(0.0, H_TOP - h)))
+            v = max(self._MIN_SPEED, v)
 
         speed = max(0.05, float(self.parameters['speed']))
-        self._spin = (self._spin + dt * speed * (1.0 + self._bass * 1.6)) % 1000.0
-        # Downhill accelerates, uphill drags; audio rides on top of that rather
-        # than replacing it, so the ride keeps its own physical rhythm.
-        base = 26.0 - self._grade * 30.0
+        # Travel stays inside one lap forever, so no coordinate ever grows.
         self._travel = (self._travel
-                        + dt * speed * max(6.0, base) * (0.75 + self._bass * 0.7)
-                        ) % (self._CIRCUIT * 64.0)
+                        + dt * speed * v * (0.8 + self._bass * 0.5)) % CIRCUIT
 
     def render(self) -> None:
         """Upload ride state and draw the view from the front car."""
@@ -371,7 +428,6 @@ class Corkscrew(BaseEffect):
         p['iSeed'].value = self._seed
         p['iSky'].value = self._sky
         p['iRollForce'].value = max(0.0, float(self.parameters['roll_force']))
-        p['iSpin'].value = float(self._spin)
         p['iGrade'].value = float(self._grade)
         self._vao.render(moderngl.TRIANGLE_STRIP)
 
@@ -380,8 +436,3 @@ class Corkscrew(BaseEffect):
         self._vao.release()
         self._vbo.release()
         self._prog.release()
-
-
-def _smoothstep(a: float, b: float, x: float) -> float:
-    t = float(np.clip((x - a) / max(b - a, 1e-6), 0.0, 1.0))
-    return t * t * (3.0 - 2.0 * t)
