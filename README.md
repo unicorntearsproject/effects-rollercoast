@@ -1,6 +1,6 @@
 # effects-rollercoast — Unicorn Viz effect pack
 
-**Version 0.2.0**
+**Version 0.3.0**
 
 Ride effects: First Drop, Corkscrew, Night Coaster, Mine Train, Coaster Cam,
 Demon Drop, Log Flume.
@@ -68,6 +68,33 @@ Coaster), `torch_gain` (Mine Train), `cam_offset` (Coaster Cam), `hang_tension`
 (Demon Drop), `splash_gain` (Log Flume).
 
 ## Changelog
+
+- **0.3.0** — the pack ran at 8-11 fps at 1080p; it now runs at 50-104. The
+  cause was structural: the fragment shader carried the whole track model, so
+  every pixel re-derived the curve. `trackPoint()` was evaluated about 560
+  times per pixel per frame — **1.2 billion times a frame** at 1080p, each with
+  three sines and a branch chain. The track is now sampled once per frame on
+  the CPU into a small uniform table (position, lateral, normal per section)
+  along with the camera basis, and the shader has no track model in it at all:
+  it projects the table and rasterizes. That also leaves one source of truth
+  for the geometry instead of a GLSL copy and a Python copy free to drift.
+
+  Three further fixes came out of measuring rather than guessing. Support bents
+  bypassed the section cull, so every far section paid four projections per
+  pixel whether or not the bent was near it — 68% of the frame. Structure
+  density was tied to the *sampling* rather than to distance, so near sections
+  stacked three or four bents in almost the same place. And in Mine Train the
+  hoops and torches were drawn after the section cull, which clipped the bore's
+  rings away entirely and drew the torchlight as hard rectangles — the cull box
+  itself, made visible. A texture-backed table was also tried for the march and
+  measured 2x *slower* than uniform arrays on this driver, so it was dropped.
+
+  Demon Drop and Log Flume are rebuilt on the same core. Demon Drop's lattice
+  mast is now built and projected on the CPU too, and the camera faces outward
+  on the hoist and tips forward through the hang, so the climb looks over the
+  park and the hang looks down the shaft instead of at empty sky. Log Flume
+  keeps its filled-quad trough, now with a rounded hull and bow wave in the
+  bottom of frame rather than a translucent wedge.
 
 - **0.2.0** — 2.0 uplift: closed-circuit track on every ride (no more unbounded
   travel or per-lap height step), energy-conservation physics, bounded periodic

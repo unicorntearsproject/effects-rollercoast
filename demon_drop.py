@@ -5,20 +5,21 @@ to go *vertical*.  A plain parametric loop cannot do that, because a track
 whose tangent is exactly the world up-vector has no lateral direction and the
 ride frame collapses to NaN.  So the plan shape here is **phase-warped**: the
 car's progress around the oval very nearly stops for the whole tower section,
-drifting just enough (about six metres of run against forty of climb) to keep
-the frame well conditioned while reading as a vertical hoist.  Everything else
-about the circuit is the pack's shared closed-loop model, so the car laps
-forever inside a bounded footprint.
+drifting just enough to keep the frame well conditioned while reading as a
+vertical hoist.  Everything else is the pack's shared closed-loop model, so the
+car laps forever inside a bounded footprint.
 
 The cycle is the real one: roll out of the station, hoist up the mast, **hang**
-at the top -- the car crawls here, which is the whole point of the ride -- then
-freefall, a curving pull-out onto the brake track, and the return run home.
-Speed away from the hoist and the hang comes from energy conservation, so the
-plunge accelerates because it is falling, not because a curve says so.
+at the top — the car crawls there, tipped forward over the drop, which is the
+whole point of the ride — then freefall, a curving pull-out onto the brake
+track, and the return run home.  Speed away from the hoist and the hang comes
+from energy conservation, so the plunge accelerates because it is falling.
 
 The mast is a real lattice: four legs from grade to crown, tied at every bay
-with horizontals and X-bracing, standing in place while the car runs the rest
-of the circuit around it.
+with horizontals and X-bracing, with the hoist cable and its crown sheave
+running up the middle.  Like the track, it is built on the CPU and handed to
+the shader already projected — the fragment program never evaluates the tower's
+geometry, it just draws the lines.
 
 Audio reactivity:
   - bass    -> speed, camera shake, mast glow
@@ -41,11 +42,23 @@ import numpy as np
 
 from unicornviz.effects.base import AudioData, BaseEffect
 
-__version__ = '0.1.0'
+__version__ = '0.3.0'
 
+# One lap, in metres. Shared by the CPU physics and the track sampler.
 CIRCUIT = 620.0
-TOWER_TOP = 42.0
+# Crest of the ride; the energy model measures every fall from just above it.
+H_TOP = 42.0            # crown of the tower
 GRAVITY = 9.81
+LAP_R = 120.0
+MAST_TOP = 47.0         # crown of the lattice, just above the crest
+MAST_HALF = 5.2         # half the mast's plan width
+MAST_BAYS = 8
+TAU = 2.0 * math.pi
+
+# March: how many track sections are sampled ahead of the train, and how far.
+STEPS = 46
+NEAR = 2.0
+FAR = 380.0
 
 _VERT = """
 #version 330
@@ -69,20 +82,33 @@ uniform float iPunch;
 uniform float iHue;
 uniform float iZoom;
 uniform float iGlitter;
-uniform float iTravel;       // position in the cycle, always within [0, CIRCUIT)
-uniform float iSeed;         // per-activation plan shape
-uniform float iSky;          // per-activation sky variant
-uniform float iGrade;        // current track gradient, tilts the horizon
+uniform float iTravel;     // position on the lap, always within [0, CIRCUIT)
+uniform float iSky;        // per-activation sky variant
+uniform float iGrade;      // current track gradient, tilts the horizon
+// The march table, sampled on the CPU once per frame. xyz is the world point
+// on the centreline; iP.w is s, the distance along the circuit, which the
+// structure uses to place ties and bents.
+uniform vec4  iP[47];
+uniform vec4  iL[47];      // xyz = lateral unit vector at that point
+uniform vec4  iN[47];      // xyz = normal ("up" out of the track bed)
+uniform vec3  iCamPos;
+uniform vec3  iCamRight;
+uniform vec3  iCamUp;
+uniform vec3  iCamFwd;
 uniform float iHang;         // 1 while the car hangs at the crown, else 0
 uniform float iHangTension;  // tweakable: how hard the hang is sold
+// The mast, already projected on the CPU: xy = screen position, z = depth
+// (<= 0 means behind the camera), w unused. Index is level * 4 + leg, nine
+// levels of four legs. iMastBox is its screen bounding box.
+uniform vec4  iMast[36];
+uniform vec4  iMastBox;
 in  vec2 v_uv;
 out vec4 fragColor;
 
 #define PI  3.14159265
 #define TAU 6.28318530
-#define STEPS 44
+#define STEPS 46
 #define CIRCUIT 620.0
-#define LAP_R 120.0
 
 float hash21(vec2 p) {
     p = mod(p, 512.0);
@@ -92,76 +118,14 @@ float hash21(vec2 p) {
 }
 vec3 palette(float t) { return 0.5 + 0.5 * cos(TAU * (t + vec3(0.0, 0.33, 0.67))); }
 
-// ── the cycle ───────────────────────────────────────────────────────────────
-// Plan progress around the oval. Almost frozen through the tower so the car
-// climbs, hangs and falls in one place; the small residual drift is what keeps
-// the ride frame from degenerating on a truly vertical tangent.
-float planPhase(float u) {
-    if (u < 0.16) return u / 0.16 * 0.26;             // roll out of the station
-    if (u < 0.62) return 0.26 + (u - 0.16) / 0.46 * 0.012;   // hoist, hang, fall
-    if (u < 0.72) return 0.272 + (u - 0.62) / 0.10 * 0.068;  // curving pull-out
-    return 0.34 + (u - 0.72) / 0.28 * 0.66;                  // brake run home
-}
-
-float rideHeight(float s) {
-    float u = fract(s / CIRCUIT);
-    if (u < 0.10) return 2.5;                                       // station
-    if (u < 0.16) return 2.5 + smoothstep(0.10, 0.16, u) * 1.5;     // approach
-    if (u < 0.44) return 4.0 + smoothstep(0.16, 0.44, u) * 38.0;    // the hoist
-    if (u < 0.52) return 42.0;                                      // the hang
-    if (u < 0.62) {                                                 // freefall
-        float d = smoothstep(0.52, 0.62, u);
-        return 42.0 - d * d * 30.0;
-    }
-    if (u < 0.72) return 12.0 - smoothstep(0.62, 0.72, u) * 9.0;    // pull-out
-    return mix(3.0, 2.5, smoothstep(0.72, 1.0, u));                 // brake run
-}
-
-vec3 trackPoint(float s) {
-    float u = fract(s / CIRCUIT);
-    float th = planPhase(u) * TAU;
-    float r = LAP_R * (1.0 + 0.17 * sin(th * 2.0 + iSeed * 6.3)
-                           + 0.07 * sin(th * 3.0 + 2.4));
-    return vec3(r * sin(th), rideHeight(s), r * cos(th));
-}
-
-float trackRoll(float s) {
-    vec3 a = trackPoint(s - 9.0), b = trackPoint(s), c = trackPoint(s + 9.0);
-    vec2 d1 = normalize(b.xz - a.xz + vec2(1e-5)), d2 = normalize(c.xz - b.xz + vec2(1e-5));
-    float turn = d1.x * d2.y - d1.y * d2.x;
-    return clamp(turn * 9.0, -1.0, 1.0) * 0.5;
-}
-
-struct Cam { vec3 pos; vec3 right; vec3 up; vec3 fwd; };
-
-Cam rideCam(float s, float shake) {
-    Cam c;
-    vec3 here = trackPoint(s);
-    vec3 tangent = normalize(trackPoint(s + 1.5) - trackPoint(s - 1.5));
-    c.fwd = normalize(mix(tangent, normalize(trackPoint(s + 20.0) - here), 0.45));
-    // A freefall rider faces *out*, not up: on the hoist and through the hang
-    // the car is tipped forward over the park. Without this the camera stares
-    // at empty sky for the whole climb and the hang frame is nearly blank.
-    if (c.fwd.y > 0.10) {
-        vec3 outward = normalize(vec3(c.fwd.x, 0.0, c.fwd.z) + vec3(1e-4, 0.0, 1e-4));
-        c.fwd = normalize(mix(c.fwd, outward, smoothstep(0.10, 0.75, c.fwd.y)));
-    }
-    // Over the hang the car tips forward, so the rider spends those seconds
-    // looking straight down the shaft they are about to fall down.
-    c.fwd = normalize(c.fwd - vec3(0.0, clamp(iHang, 0.0, 1.0) * 0.55, 0.0));
-    float roll = trackRoll(s);
-    vec3 worldUp = vec3(sin(roll), cos(roll), 0.0);
-    c.right = normalize(cross(c.fwd, worldUp));
-    c.up = cross(c.right, c.fwd);
-    c.pos = here + c.up * 1.8 + c.right * shake * 0.22 + c.up * shake * 0.16;
-    return c;
-}
-
-bool project(Cam c, vec3 P, out vec2 sp, out float depth) {
-    vec3 q = P - c.pos;
-    float z = dot(q, c.fwd);
+// World point -> screen. Fragment-independent, so it is called once per node
+// per step rather than once per structural member.
+bool project(vec3 P, out vec2 sp, out float depth) {
+    vec3 q = P - iCamPos;
+    float z = dot(q, iCamFwd);
     if (z < 0.35) return false;
-    sp = vec2(dot(q, c.right), dot(q, c.up)) / z;
+    float iz = 1.0 / z;
+    sp = vec2(dot(q, iCamRight), dot(q, iCamUp)) * iz;
     depth = z;
     return true;
 }
@@ -170,22 +134,59 @@ float segDist(vec2 p, vec2 a, vec2 b) {
     float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
     return length(pa - ba * h);
 }
-void strut(inout vec3 col, Cam cam, vec2 p, vec3 A, vec3 B,
-           float radius, vec3 c, float glow) {
-    vec2 a, b; float da, db;
-    if (!project(cam, A, a, da)) return;
-    if (!project(cam, B, b, db)) return;
-    float w = clamp(radius / min(da, db), 0.0007, 0.09);
+
+// One structural member, already projected. The screen-space bounding-box
+// reject in front is what makes a 46-step march affordable: for any given
+// pixel almost every member is nowhere near it.
+void seg2(inout vec3 col, vec2 p, vec2 a, vec2 b, float w, vec3 c, float glow) {
+    if (p.x < min(a.x, b.x) - w || p.x > max(a.x, b.x) + w ||
+        p.y < min(a.y, b.y) - w || p.y > max(a.y, b.y) + w) return;
     float d = segDist(p, a, b);
     col = mix(col, c, smoothstep(w, w * 0.45, d));
     if (glow > 0.0) col += c * smoothstep(w * 0.55, 0.0, d) * glow;
 }
-void frameAt(float s, out vec3 lat, out vec3 nrm) {
-    float roll = trackRoll(s);
-    vec3 tangent = normalize(trackPoint(s + 1.5) - trackPoint(s - 1.5));
-    vec3 worldUp = vec3(sin(roll), cos(roll), 0.0);
-    lat = normalize(cross(tangent, worldUp));
-    nrm = cross(lat, tangent);
+
+// A member given in world space, for nodes outside the shared per-step set.
+void strut(inout vec3 col, vec2 p, vec3 A, vec3 B, float radius, vec3 c, float glow) {
+    vec2 a, b; float da, db;
+    if (!project(A, a, da)) return;
+    if (!project(B, b, db)) return;
+    seg2(col, p, a, b, clamp(radius / min(da, db), 0.0007, 0.09), c, glow);
+}
+
+// One already-projected member of the mast.
+void mseg(inout vec3 col, vec2 p, vec4 A, vec4 B, float r, vec3 c, float glow) {
+    if (A.z <= 0.0 || B.z <= 0.0) return;
+    seg2(col, p, A.xy, B.xy, clamp(r / min(A.z, B.z), 0.0007, 0.09), c, glow);
+}
+
+// The lattice mast: four legs, bay ties and X-bracing, standing where the
+// tower is while the car runs the rest of the circuit around it.
+void drawMast(inout vec3 col, vec2 p, vec3 legCol) {
+    if (p.x < iMastBox.x || p.x > iMastBox.z ||
+        p.y < iMastBox.y || p.y > iMastBox.w) return;
+    for (int b = 0; b < 8; b++) {
+        for (int l = 0; l < 4; l++) {
+            int n = (l + 1) % 4;
+            mseg(col, p, iMast[b * 4 + l], iMast[(b + 1) * 4 + l],
+                 0.30, legCol, 0.0);                       // leg
+            mseg(col, p, iMast[(b + 1) * 4 + l], iMast[(b + 1) * 4 + n],
+                 0.16, legCol * 0.92, 0.0);                // bay tie
+        }
+        // X-bracing on two opposite faces is enough to read as a lattice and
+        // halves what the tower costs.
+        mseg(col, p, iMast[b * 4], iMast[(b + 1) * 4 + 1], 0.12, legCol * 0.80, 0.0);
+        mseg(col, p, iMast[b * 4 + 2], iMast[(b + 1) * 4 + 3], 0.12, legCol * 0.80, 0.0);
+    }
+    // Crown beacons, strobing on the beat the way aircraft warning lights do.
+    vec3 beacon = mix(vec3(1.0, 0.30, 0.22), palette(iHue + 0.1), 0.3);
+    for (int l = 0; l < 4; l++) {
+        vec4 A = iMast[32 + l];
+        if (A.z <= 0.0) continue;
+        float d = length(p - A.xy);
+        if (d < 0.8) col += beacon * (exp(-d * d * 1400.0) * 1.4 + exp(-d * 5.0) * 0.10)
+                          * (0.5 + iBeat * 1.6 + iTreble * 0.5);
+    }
 }
 
 vec3 skyColour(vec2 p, float tb) {
@@ -194,151 +195,187 @@ vec3 skyColour(vec2 p, float tb) {
     if (iSky < 0.34)      { lo = vec3(0.98, 0.55, 0.30); hi = vec3(0.06, 0.09, 0.30); }
     else if (iSky < 0.67) { lo = vec3(0.70, 0.85, 0.95); hi = vec3(0.05, 0.22, 0.52); }
     else                  { lo = vec3(0.85, 0.25, 0.45); hi = vec3(0.04, 0.04, 0.18); }
-    vec3 col = mix(lo, hi, pow(up, 0.8));
-    col = mix(col, palette(iHue + up * 0.3), 0.20 + iMid * 0.12);
-    float band = sin(p.y * 18.0 - tb * 0.2 + sin(p.x * 2.4) * 1.1);
-    col += vec3(1.0, 0.9, 0.8) * smoothstep(0.92, 1.0, band)
-         * (0.08 + iMid * 0.18) * (1.0 - up);
+    vec3 col = mix(lo, hi, pow(up, 0.75));
+    col = mix(col, palette(iHue + up * 0.3), 0.22 + iMid * 0.10);
+    float band = sin(p.y * 22.0 - tb * 0.25 + sin(p.x * 2.0) * 1.2);
+    col += vec3(1.0, 0.85, 0.75) * smoothstep(0.90, 1.0, band)
+         * (0.10 + iMid * 0.20) * (1.0 - up);
+    vec2 sunP = vec2(0.30, 0.10 - iGrade * 0.5);
+    col += mix(vec3(1.0, 0.75, 0.35), palette(iHue + 0.1), 0.35)
+         * exp(-length(p - sunP) * 5.0) * (0.9 + iBass * 0.7);
     return col;
-}
-
-// The mast: four legs, bay ties and X-bracing, standing where the tower is.
-void drawMast(inout vec3 col, Cam cam, vec2 p, vec3 legCol) {
-    vec3 anchor = trackPoint(CIRCUIT * 0.39);   // centred on the vertical run
-    vec2 c = anchor.xz;
-    float half_ = 5.2;
-    vec2 o[4];
-    o[0] = vec2(-half_, -half_); o[1] = vec2(half_, -half_);
-    o[2] = vec2(half_, half_);   o[3] = vec2(-half_, half_);
-    for (int i = 0; i < 4; i++) {
-        vec3 a = vec3(c.x + o[i].x, 0.0, c.y + o[i].y);
-        vec3 b = vec3(c.x + o[i].x, 47.0, c.y + o[i].y);
-        strut(col, cam, p, a, b, 0.30, legCol, 0.0);
-    }
-    for (int bay = 0; bay < 8; bay++) {
-        float y0 = float(bay) * 6.0, y1 = y0 + 6.0;
-        for (int i = 0; i < 4; i++) {
-            int j = int(mod(float(i) + 1.0, 4.0));
-            vec3 a0 = vec3(c.x + o[i].x, y1, c.y + o[i].y);
-            vec3 b0 = vec3(c.x + o[j].x, y1, c.y + o[j].y);
-            vec3 a1 = vec3(c.x + o[i].x, y0, c.y + o[i].y);
-            vec3 b1 = vec3(c.x + o[j].x, y0, c.y + o[j].y);
-            strut(col, cam, p, a0, b0, 0.16, legCol * 0.92, 0.0);
-            strut(col, cam, p, a1, b0, 0.12, legCol * 0.80, 0.0);
-        }
-    }
-    // Crown beacons, strobing on the beat the way aircraft warning lights do.
-    for (int i = 0; i < 4; i++) {
-        vec3 b = vec3(c.x + o[i].x, 47.6, c.y + o[i].y);
-        vec2 sp; float dz;
-        if (project(cam, b, sp, dz)) {
-            float d = length(p - sp);
-            col += mix(vec3(1.0, 0.30, 0.22), palette(iHue + 0.1), 0.3)
-                 * (exp(-d * d * 1400.0) * 1.4 + exp(-d * 5.0) * 0.10)
-                 * (0.5 + iBeat * 1.6 + iTreble * 0.5);
-        }
-    }
 }
 
 void main() {
     float A = iResolution.x / max(iResolution.y, 1.0);
     float tb = mod(iTime, 300.0);
-    float shake = iBass * 0.5 + iPunch * 0.9;
+    float shake = iBass * 0.5 + iPunch * 0.8;
     vec2 p = (v_uv - 0.5) * vec2(A, 1.0) / max(iZoom, 0.05);
-    p += vec2(sin(tb * 51.0), sin(tb * 43.0 + 1.3)) * shake * 0.005;
+    p += vec2(sin(tb * 47.0), sin(tb * 39.0 + 1.1)) * shake * 0.006;
 
-    Cam cam = rideCam(iTravel, shake);
     vec3 col = skyColour(p, tb);
 
-    vec3 rd = normalize(cam.fwd + p.x * cam.right + p.y * cam.up);
-    if (rd.y < -0.0015 && cam.pos.y > 0.2) {
-        float td = -cam.pos.y / rd.y;
+    vec3 rd = normalize(iCamFwd + p.x * iCamRight + p.y * iCamUp);
+    if (rd.y < -0.0015 && iCamPos.y > 0.2) {
+        float td = -iCamPos.y / rd.y;
         if (td > 0.0 && td < 900.0) {
-            vec3 g = cam.pos + rd * td;
-            vec2 cell = abs(fract(g.xz * 0.05) - 0.5);
-            float line = smoothstep(0.04, 0.0, min(cell.x, cell.y));
-            vec3 gnd = mix(vec3(0.035, 0.040, 0.055), palette(iHue + 0.55), 0.22);
-            gnd += mix(vec3(0.40, 0.85, 1.0), palette(iHue + 0.2), 0.35)
-                 * line * (0.30 + iBass * 0.5);
-            float lamp = hash21(floor(g.xz * 0.09));
-            gnd += mix(vec3(1.0, 0.82, 0.45), palette(iHue + 0.1), 0.3)
-                 * step(0.968, lamp)
-                 * smoothstep(0.42, 0.0, length(fract(g.xz * 0.09) - 0.5))
-                 * (0.8 + iTreble * 1.1);
-            col = mix(col, gnd, exp(-td * 0.0042));
+            vec3 g = iCamPos + rd * td;
+            vec2 cell = abs(fract(g.xz * 0.06) - 0.5);
+            float line = smoothstep(0.045, 0.0, min(cell.x, cell.y));
+            vec3 gnd = mix(vec3(0.030, 0.035, 0.055), palette(iHue + 0.55), 0.25);
+            gnd += mix(vec3(0.35, 0.85, 1.0), palette(iHue + 0.2), 0.35)
+                 * line * (0.35 + iBass * 0.5);
+            float lamp = hash21(floor(g.xz * 0.10));
+            gnd += mix(vec3(1.0, 0.80, 0.45), palette(iHue + 0.1), 0.3)
+                 * step(0.965, lamp)
+                 * smoothstep(0.42, 0.0, length(fract(g.xz * 0.10) - 0.5))
+                 * (0.8 + iTreble * 1.2);
+            col = mix(col, gnd, exp(-td * 0.0045));
         }
     }
 
-    vec3 legCol  = mix(vec3(0.24, 0.25, 0.30), palette(iHue + 0.42), 0.32);
-    vec3 railCol = mix(vec3(0.88, 0.92, 1.00), palette(iHue + 0.15), 0.42);
-    vec3 tieCol  = mix(vec3(0.34, 0.30, 0.26), palette(iHue + 0.62), 0.26);
-    drawMast(col, cam, p, legCol);
+    // ── the structure, marched far to near so crests occlude what is beyond ──
+    vec3 railCol  = mix(vec3(0.85, 0.90, 1.00), palette(iHue + 0.15), 0.45);
+    drawMast(col, p, mix(vec3(0.24, 0.25, 0.30), palette(iHue + 0.42), 0.32));
+    vec3 spineCol = mix(vec3(0.16, 0.18, 0.24), palette(iHue + 0.45), 0.30);
+    vec3 tieCol   = mix(vec3(0.40, 0.26, 0.16), palette(iHue + 0.60), 0.28);
+    const float GAUGE = 1.6, SPINE = 2.1;
 
-    const float NEAR = 2.0, FAR = 380.0, GAUGE = 1.5, SPINE = 1.9;
     for (int i = STEPS - 1; i >= 0; i--) {
-        float f0 = float(i) / float(STEPS);
-        float f1 = float(i + 1) / float(STEPS);
-        float s0 = iTravel + NEAR + f0 * f0 * FAR;
-        float s1 = iTravel + NEAR + f1 * f1 * FAR;
-        vec3 c0 = trackPoint(s0), c1 = trackPoint(s1);
-        vec3 lat0, nrm0, lat1, nrm1;
-        frameAt(s0, lat0, nrm0);
-        frameAt(s1, lat1, nrm1);
-        float fade = 1.0 - f0 * 0.72;
-        float glow = (0.28 + iTreble * 0.85) * fade;
+        vec3 c0 = iP[i].xyz,     c1 = iP[i + 1].xyz;
+        vec3 l0 = iL[i].xyz,     l1 = iL[i + 1].xyz;
+        vec3 n0 = iN[i].xyz,     n1 = iN[i + 1].xyz;
+        float s0 = iP[i].w, s1 = iP[i + 1].w;
 
-        strut(col, cam, p, c0 - nrm0 * SPINE - lat0 * 0.45,
-                          c1 - nrm1 * SPINE - lat1 * 0.45, 0.18, legCol * fade, 0.0);
-        strut(col, cam, p, c0 - nrm0 * SPINE + lat0 * 0.45,
-                          c1 - nrm1 * SPINE + lat1 * 0.45, 0.18, legCol * fade, 0.0);
-        if (f0 < 0.40) {
+        // Ties and bents sit at fixed spacings along the track, and a section
+        // carries one when its span crosses that spacing. Testing the section's
+        // own s against a square wave instead -- what 0.2.0 did -- ties the
+        // structure's density to the sampling: near sections are two metres
+        // apart, so three or four in a row would each stack a bent in almost
+        // the same place, and far sections would each grow one 30 m long.
+        bool hasTie  = floor(s1 / 1.8) > floor(s0 / 1.8);
+float u0 = fract(s0 / CIRCUIT);
+        bool hasBent = floor(s1 / 14.0) > floor(s0 / 14.0) && c0.y > 3.5
+                    && (u0 < 0.14 || u0 > 0.66);   // the mast carries the tower
+
+        // Reject the whole section if this pixel is nowhere near it. A
+        // section's members all live within about 3.6 m of its centreline, so
+        // that radius over the near depth bounds them on screen.
+        vec2 a, b; float da, db;
+        bool va = project(c0, a, da), vb = project(c1, b, db);
+        bool inSection = true;
+        if (va && vb) {
+            float rad = 3.6 / max(min(da, db), 0.5);
+            inSection = !(p.x < min(a.x, b.x) - rad || p.x > max(a.x, b.x) + rad ||
+                          p.y < min(a.y, b.y) - rad || p.y > max(a.y, b.y) + rad);
+        } else if (!va && !vb) {
+            inSection = false;
+        }
+        // Reject the bent against the section's own projected point before
+        // projecting its four corners. A long far section always spans a bent
+        // spacing, so without this every far section pays four projections per
+        // pixel whether or not the bent is anywhere near it -- which was most
+        // of the frame. The bent hangs below the track within about 3 m of it.
+        if (hasBent && va) {
+            float bw = 4.0 / max(da, 0.5);
+            hasBent = !(p.x < a.x - bw || p.x > a.x + bw || p.y > a.y + bw);
+        }
+        if (!inSection && !hasBent) continue;
+
+        float f0 = float(i) / float(STEPS);
+        float fade = 1.0 - f0 * 0.75;
+        float glow = (0.30 + iTreble * 0.9) * fade;
+
+        // Box spine under the rails: two chords, so the track has depth.
+        if (inSection) {
+        strut(col, p, c0 - n0 * SPINE - l0 * 0.5,
+                      c1 - n1 * SPINE - l1 * 0.5, 0.20, spineCol * fade, 0.0);
+        strut(col, p, c0 - n0 * SPINE + l0 * 0.5,
+                      c1 - n1 * SPINE + l1 * 0.5, 0.20, spineCol * fade, 0.0);
+
+        // Zig-zag truss lacing tying the spine to the rails. Near steps only --
+        // at distance it collapses into noise and costs the same to draw.
+        if (f0 < 0.42) {
             float zig = mod(floor(s0 * 0.5), 2.0) < 1.0 ? -1.0 : 1.0;
-            strut(col, cam, p, c0 - nrm0 * SPINE + lat0 * (0.45 * zig),
-                              c1 + lat1 * (GAUGE * zig), 0.10, legCol * 0.9 * fade, 0.0);
+            strut(col, p, c0 - n0 * SPINE + l0 * (0.5 * zig),
+                          c1 + l1 * (GAUGE * zig), 0.11, spineCol * 0.95 * fade, 0.0);
         }
-        if (mod(floor(s0 * 0.6), 1.0) < 0.5) {
-            strut(col, cam, p, c0 - lat0 * GAUGE * 1.2, c0 + lat0 * GAUGE * 1.2,
-                  0.12, tieCol * (0.4 + fade * 0.7), 0.0);
+
+        // Cross ties.
+        if (hasTie) {
+            strut(col, p, c0 - l0 * GAUGE * 1.25, c0 + l0 * GAUGE * 1.25,
+                  0.13, tieCol * (0.4 + fade * 0.7), 0.0);
         }
+
+        // The running rails, drawn last so they sit on top of the structure.
         for (int r = -1; r <= 1; r += 2) {
-            strut(col, cam, p, c0 + lat0 * (GAUGE * float(r)),
-                              c1 + lat1 * (GAUGE * float(r)),
-                  0.16, railCol * (0.45 + fade * 0.85 + iBass * 0.3), glow);
+            strut(col, p, c0 + l0 * (GAUGE * float(r)), c1 + l1 * (GAUGE * float(r)),
+                  0.17, railCol * (0.45 + fade * 0.85 + iBass * 0.35), glow);
         }
-        // Brake-run bents, skipped through the tower where the mast carries it.
-        float u0 = fract(s0 / CIRCUIT);
-        if (mod(floor(s0 * 0.08), 1.0) < 0.5 && c0.y > 3.5
-            && (u0 < 0.14 || u0 > 0.66)) {
-            vec3 baseL = vec3((c0 - lat0 * 2.4).x, 0.0, (c0 - lat0 * 2.4).z);
-            vec3 baseR = vec3((c0 + lat0 * 2.4).x, 0.0, (c0 + lat0 * 2.4).z);
-            vec3 topL = c0 - nrm0 * SPINE - lat0 * 0.8;
-            vec3 topR = c0 - nrm0 * SPINE + lat0 * 0.8;
-            vec3 midL = mix(topL, baseL, 0.5), midR = mix(topR, baseR, 0.5);
-            strut(col, cam, p, topL, baseL, 0.15, legCol * fade, 0.0);
-            strut(col, cam, p, topR, baseR, 0.15, legCol * fade, 0.0);
-            strut(col, cam, p, topL, midR, 0.09, legCol * 0.85 * fade, 0.0);
-            strut(col, cam, p, topR, midL, 0.09, legCol * 0.85 * fade, 0.0);
-            strut(col, cam, p, midL, midR, 0.09, legCol * 0.85 * fade, 0.0);
+        }
+
+        // Support bents: paired legs, a cross brace and footers. A bent reaches
+        // all the way to grade, far outside its section's screen box, so it
+        // carries its own -- four corners projected, then one box test gates
+        // the whole assembly. Letting it bypass the cull instead cost 68% of
+        // the frame.
+        if (hasBent) {
+            vec3 baseL = vec3((c0 - l0 * 2.6).x, 0.0, (c0 - l0 * 2.6).z);
+            vec3 baseR = vec3((c0 + l0 * 2.6).x, 0.0, (c0 + l0 * 2.6).z);
+            vec3 topL = c0 - n0 * SPINE - l0 * 0.9;
+            vec3 topR = c0 - n0 * SPINE + l0 * 0.9;
+            vec2 bl, br, tl, tr; float z0, z1, z2, z3;
+            bool ok = project(baseL, bl, z0) && project(baseR, br, z1)
+                   && project(topL, tl, z2) && project(topR, tr, z3);
+            bool draw = true;
+            if (ok) {
+                float bw = 0.3 / max(min(min(z0, z1), min(z2, z3)), 0.5);
+                vec2 lo = min(min(bl, br), min(tl, tr)) - bw;
+                vec2 hi = max(max(bl, br), max(tl, tr)) + bw;
+                draw = !(p.x < lo.x || p.x > hi.x || p.y < lo.y || p.y > hi.y);
+            }
+            if (draw && ok) {
+                // Project the six distinct nodes once and draw in screen space.
+                // Seven world-space members would re-project shared nodes 14
+                // times over, and projection is the bent's dominant cost.
+                vec2 ml, mr; float z4, z5;
+                project(mix(topL, baseL, 0.5), ml, z4);
+                project(mix(topR, baseR, 0.5), mr, z5);
+                vec3 legCol = mix(vec3(0.20, 0.22, 0.28), palette(iHue + 0.4), 0.30) * fade;
+                float wL = clamp(0.17 / min(z2, z0), 0.0007, 0.09);
+                float wR = clamp(0.17 / min(z3, z1), 0.0007, 0.09);
+                float wX = clamp(0.10 / min(min(z2, z3), min(z4, z5)), 0.0007, 0.09);
+                float wF = clamp(0.09 / min(min(z4, z5), min(z0, z1)), 0.0007, 0.09);
+                seg2(col, p, tl, bl, wL, legCol, 0.0);
+                seg2(col, p, tr, br, wR, legCol, 0.0);
+                // Cross bracing, and a horizontal tie halfway down.
+                seg2(col, p, tl, mr, wX, legCol * 0.9, 0.0);
+                seg2(col, p, tr, ml, wX, legCol * 0.9, 0.0);
+                seg2(col, p, ml, mr, wX, legCol * 0.9, 0.0);
+                seg2(col, p, ml, br, wF, legCol * 0.85, 0.0);
+                seg2(col, p, mr, bl, wF, legCol * 0.85, 0.0);
+            }
         }
     }
+
+    // Speed lines radiating from the vanishing point.
+    float ang = atan(p.y, p.x);
+    float rad = length(p);
+    float lane = floor(ang / TAU * 96.0);
+    float lh = hash21(vec2(lane, 7.0));
+    float ph = fract(lh + iTravel * 0.02);
+    float along = fract(rad * 1.6 - ph * 2.0);
+    float across = abs(fract(ang / TAU * 96.0) - 0.5) * 2.0;
+    float streak = smoothstep(0.22, 0.0, across)
+                 * smoothstep(0.55, 0.92, along) * smoothstep(1.0, 0.93, along);
+    col += vec3(0.85, 0.93, 1.0) * streak * step(0.55, lh)
+         * smoothstep(0.18, 0.75, rad) * (0.30 + iTreble * 0.9 + iBass * 0.5)
+         * iGlitter * (1.0 - clamp(iHang, 0.0, 1.0) * 0.8);
 
     // The hang: the whole frame holds its breath, then the floor drops out.
     float hang = clamp(iHang, 0.0, 1.0) * clamp(iHangTension, 0.0, 3.0);
     col *= 1.0 - hang * 0.30;
-    col += palette(iHue + 0.05) * hang * 0.06
-         * (0.5 + 0.5 * sin(tb * 9.0));
-
-    // Air rush past the car once it is falling.
-    float rad = length(p);
-    float lane = floor(atan(p.y, p.x) / TAU * 84.0);
-    float lh = hash21(vec2(lane, 3.0));
-    float along = fract(rad * 1.7 - fract(lh + iTravel * 0.03) * 2.0);
-    float across = abs(fract(atan(p.y, p.x) / TAU * 84.0) - 0.5) * 2.0;
-    col += vec3(0.88, 0.94, 1.0)
-         * smoothstep(0.24, 0.0, across)
-         * smoothstep(0.55, 0.94, along) * smoothstep(1.0, 0.92, along)
-         * step(0.5, lh) * smoothstep(0.18, 0.8, rad)
-         * (0.25 + iTreble * 0.9 + iBass * 0.5) * iGlitter * (1.0 - hang * 0.8);
+    col += palette(iHue + 0.05) * hang * 0.06 * (0.5 + 0.5 * sin(tb * 9.0));
 
     col += palette(iHue + 0.5) * iBeat * 0.12;
     col *= smoothstep(1.5, 0.22, length(v_uv - 0.5));
@@ -349,28 +386,85 @@ void main() {
 """
 
 
-def _smoothstep(a: float, b: float, x: float) -> float:
-    t = min(1.0, max(0.0, (x - a) / max(b - a, 1e-6)))
+def _sstep(a: float, b: float, x: np.ndarray) -> np.ndarray:
+    """Vectorised GLSL smoothstep."""
+    t = np.clip((x - a) / max(b - a, 1e-6), 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
 
 
-def ride_height(s: float) -> float:
-    """CPU mirror of the shader's rideHeight, for the physics integrator."""
+def ride_height(s: np.ndarray) -> np.ndarray:
+    """Height above grade at distance ``s`` around the cycle."""
     u = (s / CIRCUIT) % 1.0
-    if u < 0.10:
-        return 2.5
-    if u < 0.16:
-        return 2.5 + _smoothstep(0.10, 0.16, u) * 1.5
-    if u < 0.44:
-        return 4.0 + _smoothstep(0.16, 0.44, u) * 38.0
-    if u < 0.52:
-        return 42.0
-    if u < 0.62:
-        d = _smoothstep(0.52, 0.62, u)
-        return 42.0 - d * d * 30.0
-    if u < 0.72:
-        return 12.0 - _smoothstep(0.62, 0.72, u) * 9.0
-    return 3.0 + (2.5 - 3.0) * _smoothstep(0.72, 1.0, u)
+    d_fall = _sstep(0.52, 0.62, u)
+    return np.select(
+        [u < 0.10, u < 0.16, u < 0.44, u < 0.52, u < 0.62, u < 0.72],
+        [np.full_like(u, 2.5),                              # station
+         2.5 + _sstep(0.10, 0.16, u) * 1.5,                 # approach
+         4.0 + _sstep(0.16, 0.44, u) * 38.0,                # the hoist
+         np.full_like(u, 42.0),                             # the hang
+         42.0 - d_fall * d_fall * 30.0,                     # freefall
+         12.0 - _sstep(0.62, 0.72, u) * 9.0],               # pull-out
+        3.0 + (2.5 - 3.0) * _sstep(0.72, 1.0, u))           # brake run
+
+
+def plan_phase(u: np.ndarray) -> np.ndarray:
+    """Progress around the oval, almost frozen through the tower.
+
+    The residual drift is what keeps the ride frame from degenerating on a
+    truly vertical tangent: a track whose tangent is exactly world-up has no
+    lateral direction, and the frame comes out NaN.
+    """
+    return np.select(
+        [u < 0.16, u < 0.62, u < 0.72],
+        [u / 0.16 * 0.26,                                   # out of the station
+         0.26 + (u - 0.16) / 0.46 * 0.012,                  # hoist, hang, fall
+         0.272 + (u - 0.62) / 0.10 * 0.068],                # curving pull-out
+        0.34 + (u - 0.72) / 0.28 * 0.66)                    # brake run home
+
+
+def track_point(s: np.ndarray, seed: float) -> np.ndarray:
+    """The circuit's centreline: a closed curve, so coordinates stay bounded."""
+    th = plan_phase((s / CIRCUIT) % 1.0) * TAU
+    r = LAP_R * (1.0 + 0.17 * np.sin(th * 2.0 + seed * 6.3)
+                     + 0.07 * np.sin(th * 3.0 + 2.4))
+    return np.stack([r * np.sin(th), ride_height(s), r * np.cos(th)], axis=-1)
+
+
+def _unit(v: np.ndarray) -> np.ndarray:
+    return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-6)
+
+
+def track_roll(s: np.ndarray, seed: float) -> np.ndarray:
+    """Bank angle, taken from the actual plan curvature rather than a sine."""
+    a = track_point(s - 9.0, seed)
+    b = track_point(s, seed)
+    c = track_point(s + 9.0, seed)
+    d1 = _unit(b[..., ::2] - a[..., ::2])
+    d2 = _unit(c[..., ::2] - b[..., ::2])
+    turn = d1[..., 0] * d2[..., 1] - d1[..., 1] * d2[..., 0]
+    return np.clip(turn * 9.0, -1.0, 1.0) * 0.5
+
+
+def track_frame(s: np.ndarray, seed: float) -> tuple[np.ndarray, np.ndarray]:
+    """Lateral and normal unit vectors at ``s``, banked with the track."""
+    roll = track_roll(s, seed)
+    tan = _unit(track_point(s + 1.5, seed) - track_point(s - 1.5, seed))
+    up = np.stack([np.sin(roll), np.cos(roll), np.zeros_like(roll)], axis=-1)
+    lat = _unit(np.cross(tan, up))
+    return lat, np.cross(lat, tan)
+
+
+def mast_nodes(seed: float) -> np.ndarray:
+    """World-space lattice nodes, level-major: index = level * 4 + leg."""
+    anchor = track_point(np.array([CIRCUIT * 0.39]), seed)[0]
+    off = np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]]) * MAST_HALF
+    levels = np.linspace(0.0, MAST_TOP, MAST_BAYS + 1)
+    out = np.zeros((4 * (MAST_BAYS + 1), 3))
+    for i, y in enumerate(levels):
+        out[i * 4:i * 4 + 4, 0] = anchor[0] + off[:, 0]
+        out[i * 4:i * 4 + 4, 1] = y
+        out[i * 4:i * 4 + 4, 2] = anchor[2] + off[:, 1]
+    return out
 
 
 class DemonDrop(BaseEffect):
@@ -408,10 +502,88 @@ class DemonDrop(BaseEffect):
         self._sky = float(self.rng.uniform(0.0, 1.0))
         self._travel = float(self.rng.uniform(0.0, CIRCUIT))
         self._grade = 0.0
+        self._shake = 0.0
         self._hang = 0.0
+        self._mast = mast_nodes(self._seed)
+        self._tbl_mast = np.zeros((4 * (MAST_BAYS + 1), 4), dtype='f4')
+
+        # March table, filled in place each frame and uploaded as uniforms.
+        f = np.arange(STEPS + 1, dtype=np.float64) / STEPS
+        self._march_f2 = f * f
+        self._tbl_p = np.zeros((STEPS + 1, 4), dtype='f4')
+        self._tbl_l = np.zeros((STEPS + 1, 4), dtype='f4')
+        self._tbl_n = np.zeros((STEPS + 1, 4), dtype='f4')
+        self._probe = np.zeros(3, dtype=np.float64)
+        self._build_march()
+
+    def _build_march(self) -> None:
+        """Sample the circuit ahead of the train and place the camera on it.
+
+        Everything the shader needs about the track is produced here, once per
+        frame: the fragment program has no track model in it at all. That is
+        both the performance fix (the geometry was being re-derived per pixel)
+        and the correctness one -- there is a single source of truth for the
+        circuit rather than a GLSL copy and a Python copy free to drift.
+        """
+        s = self._travel + NEAR + self._march_f2 * FAR
+        pts = track_point(s, self._seed)
+        lat, nrm = track_frame(s, self._seed)
+        self._tbl_p[:, :3] = pts
+        self._tbl_p[:, 3] = s
+        self._tbl_l[:, :3] = lat
+        self._tbl_n[:, :3] = nrm
+
+        # The camera rides the curve: position from it, orientation from its
+        # tangent, roll from its lateral curvature.
+        t = np.array([self._travel], dtype=np.float64)
+        here = track_point(t, self._seed)[0]
+        tangent = _unit(track_point(t + 1.5, self._seed)
+                        - track_point(t - 1.5, self._seed))[0]
+        ahead = _unit(track_point(t + 22.0, self._seed)[0] - here)
+        fwd = _unit(tangent + (ahead - tangent) * 0.5)
+        # A freefall rider faces *out*, not up: on the hoist and through the
+        # hang the car is tipped forward over the park. Without this the camera
+        # stares at empty sky for the whole climb and the hang frame is blank.
+        if fwd[1] > 0.10:
+            outward = _unit(np.array([fwd[0], 0.0, fwd[2]]) + 1e-4)
+            fwd = _unit(fwd + (outward - fwd) * _sstep(0.10, 0.75, fwd[1]))
+        # Over the hang the car tips forward, so the rider spends those seconds
+        # looking straight down the shaft they are about to fall down.
+        fwd = _unit(fwd - np.array([0.0, self._hang * 0.55, 0.0]))
+        roll = float(track_roll(t, self._seed)[0])
+        world_up = np.array([math.sin(roll), math.cos(roll), 0.0])
+        right = _unit(np.cross(fwd, world_up))
+        up = np.cross(right, fwd)
+        shake = self._shake
+        pos = here + up * 1.9 + right * shake * 0.25 + up * shake * 0.18
+
+        p = self._prog
+        p['iP'].write(self._tbl_p.tobytes())
+        p['iL'].write(self._tbl_l.tobytes())
+        p['iN'].write(self._tbl_n.tobytes())
+        p['iCamPos'].value = tuple(float(x) for x in pos)
+        p['iCamRight'].value = tuple(float(x) for x in right)
+        p['iCamUp'].value = tuple(float(x) for x in up)
+        p['iCamFwd'].value = tuple(float(x) for x in fwd)
+
+        # Project the mast here too: the camera basis is already in hand, and
+        # the fragment shader then never touches the tower's geometry.
+        q = self._mast - pos
+        z = q @ fwd
+        self._tbl_mast[:, 0] = np.where(z > 0.35, (q @ right) / np.maximum(z, 1e-3), 0.0)
+        self._tbl_mast[:, 1] = np.where(z > 0.35, (q @ up) / np.maximum(z, 1e-3), 0.0)
+        self._tbl_mast[:, 2] = np.where(z > 0.35, z, -1.0)
+        p['iMast'].write(self._tbl_mast.tobytes())
+        vis = self._tbl_mast[self._tbl_mast[:, 2] > 0.0]
+        if len(vis):
+            m = 0.12
+            p['iMastBox'].value = (float(vis[:, 0].min()) - m, float(vis[:, 1].min()) - m,
+                                   float(vis[:, 0].max()) + m, float(vis[:, 1].max()) + m)
+        else:
+            p['iMastBox'].value = (1.0, 1.0, -1.0, -1.0)
 
     def update(self, dt: float, audio: AudioData) -> None:
-        """Run the cycle: cable on the hoist, gravity everywhere else."""
+        """Advance the train by conserving energy, and track the audio."""
         super().update(dt, audio)
         react = max(0.05, float(self.parameters['reactivity']))
         self._bass = float(np.clip(audio.bass_n * react, 0.0, 2.0))
@@ -422,14 +594,18 @@ class DemonDrop(BaseEffect):
             self._punch = 1.0
         self._beat = max(0.0, self._beat - dt * 5.0)
         self._punch = max(0.0, self._punch - dt * 2.2)
+        self._shake = ((self._bass * 0.5 + self._punch * 0.8)
+                       )
 
-        u = (self._travel / CIRCUIT) % 1.0
-        h = ride_height(self._travel)
         ahead = 5.0
-        self._grade = float(np.clip(
-            (ride_height(self._travel + ahead) - ride_height(self._travel - ahead))
-            / (2 * ahead), -1.5, 1.5))
+        self._probe[:] = (self._travel - ahead, self._travel, self._travel + ahead)
+        heights = ride_height(self._probe)
+        h = float(heights[1])
+        self._grade = float(np.clip((heights[2] - heights[0]) / (2 * ahead), -1.5, 1.5))
 
+        # Energy conservation: everything the train has, it got by falling.
+        # On the lift the chain sets the pace instead.
+        u = (self._travel / CIRCUIT) % 1.0
         if 0.16 <= u < 0.44:
             v = self._HOIST_SPEED
             self._hang = 0.0
@@ -437,18 +613,19 @@ class DemonDrop(BaseEffect):
             v = self._HANG_SPEED
             self._hang = 1.0
         else:
-            v = math.sqrt(max(0.0, 2.0 * GRAVITY * max(0.0, TOWER_TOP - h)))
+            v = math.sqrt(max(0.0, 2.0 * GRAVITY * max(0.0, H_TOP - h)))
             v = max(self._MIN_SPEED, v)
             if u >= 0.72 or u < 0.10:
                 v = min(v, self._BRAKE_SPEED)
             self._hang = 0.0
 
         speed = max(0.05, float(self.parameters['speed']))
+        # Travel stays inside one lap forever, so no coordinate ever grows.
         self._travel = (self._travel
                         + dt * speed * v * (0.8 + self._bass * 0.5)) % CIRCUIT
 
     def render(self) -> None:
-        """Upload cycle state and draw the view from the falling car."""
+        """Upload ride state and draw the view from the front car."""
         p = self._prog
         p['iTime'].value = float(self.time)
         p['iResolution'].value = (float(self.width), float(self.height))
@@ -461,11 +638,11 @@ class DemonDrop(BaseEffect):
         p['iZoom'].value = max(0.05, float(self.parameters['zoom']))
         p['iGlitter'].value = max(0.0, float(self.parameters['glitter']))
         p['iTravel'].value = float(self._travel)
-        p['iSeed'].value = self._seed
         p['iSky'].value = self._sky
         p['iGrade'].value = float(self._grade)
         p['iHang'].value = float(self._hang)
         p['iHangTension'].value = max(0.0, float(self.parameters['hang_tension']))
+        self._build_march()
         self._vao.render(moderngl.TRIANGLE_STRIP)
 
     def destroy(self) -> None:

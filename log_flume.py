@@ -2,21 +2,30 @@
 
 The other rides in this pack are built from lines: rails, chords, bracing.  A
 flume is built from *surfaces*, so this one adds a filled-quad primitive on top
-of the shared closed-circuit model.  Each marched section of the circuit paints
-a real trough -- two timber side walls and the water between them -- as screen
--space quads with a proper triangle-coverage test, which is what makes the
-channel read as something you are floating *inside* rather than a line you are
-following.  The trough stands on timber trestle bents with X-bracing and sill
-beams, the way a real flume's runs are carried.
+of the shared closed-circuit model.  Each marched section paints a real trough
+— two timber side walls and the water between them — as screen-space quads
+with a proper triangle-coverage test, which is what makes the channel read as
+something you are floating *inside* rather than a line you are following.  The
+trough is carried on timber trestle bents with X-bracing and sill beams, the
+way a real flume's runs are.
 
 The water moves.  Its shimmer is driven along the channel by the log's own
 travel, so the surface streams past at the speed the ride is actually doing,
-and the splashdown throws a burst of spray that decays over the run-out.
+and the splashdown throws a sheet of spray over the camera that decays across
+the run-out.
 
 Two conveyors, a baby drop and the big splashdown.  Away from the conveyors the
 log runs on energy conservation like the coasters, but with a water-drag
-ceiling on the run-out -- a flume that kept its splashdown speed all the way
+ceiling on the run-out — a flume that kept its splashdown speed all the way
 home would look wrong, and a real one does not.
+
+**The track is sampled on the CPU, once per frame.** The geometry does not vary
+per pixel, but deriving it inside the fragment loop meant about 560
+``trackPoint()`` evaluations per pixel per frame — 1.2 billion at 1080p — which
+is what pinned this pack at 8 fps. ``_build_march()`` samples the circuit into
+a small uniform table and hands the shader the camera basis too, so the
+fragment program has no track model in it at all: it projects the table and
+rasterizes.
 
 Audio reactivity:
   - bass    -> speed, hull rock, water body glow
@@ -39,11 +48,20 @@ import numpy as np
 
 from unicornviz.effects.base import AudioData, BaseEffect
 
-__version__ = '0.1.0'
+__version__ = '0.3.0'
 
+# One lap, in metres. Shared by the CPU physics and the track sampler.
 CIRCUIT = 780.0
-H_TOP = 32.0
+# Crest of the ride; the energy model measures every fall from just above it.
+H_TOP = 32.0            # the splashdown crest
 GRAVITY = 9.81
+LAP_R = 150.0
+TAU = 2.0 * math.pi
+
+# March: how many track sections are sampled ahead of the train, and how far.
+STEPS = 40
+NEAR = 2.0
+FAR = 400.0
 
 _VERT = """
 #version 330
@@ -67,10 +85,19 @@ uniform float iPunch;
 uniform float iHue;
 uniform float iZoom;
 uniform float iGlitter;
-uniform float iTravel;      // position on the lap, always within [0, CIRCUIT)
-uniform float iSeed;        // per-activation plan shape
-uniform float iSky;         // per-activation sky variant
-uniform float iGrade;       // current track gradient, tilts the horizon
+uniform float iTravel;     // position on the lap, always within [0, CIRCUIT)
+uniform float iSky;        // per-activation sky variant
+uniform float iGrade;      // current track gradient, tilts the horizon
+// The march table, sampled on the CPU once per frame. xyz is the world point
+// on the centreline; iP.w is s, the distance along the circuit, which the
+// structure uses to place ties and bents.
+uniform vec4  iP[41];
+uniform vec4  iL[41];      // xyz = lateral unit vector at that point
+uniform vec4  iN[41];      // xyz = normal ("up" out of the track bed)
+uniform vec3  iCamPos;
+uniform vec3  iCamRight;
+uniform vec3  iCamUp;
+uniform vec3  iCamFwd;
 uniform float iSplash;      // 1 at splashdown, decaying over the run-out
 uniform float iSplashGain;  // tweakable: how much water gets thrown
 in  vec2 v_uv;
@@ -79,8 +106,6 @@ out vec4 fragColor;
 #define PI  3.14159265
 #define TAU 6.28318530
 #define STEPS 40
-#define CIRCUIT 780.0
-#define LAP_R 150.0
 
 float hash21(vec2 p) {
     p = mod(p, 512.0);
@@ -90,57 +115,14 @@ float hash21(vec2 p) {
 }
 vec3 palette(float t) { return 0.5 + 0.5 * cos(TAU * (t + vec3(0.0, 0.33, 0.67))); }
 
-// ── the circuit ─────────────────────────────────────────────────────────────
-float rideHeight(float s) {
-    float u = fract(s / CIRCUIT);
-    if (u < 0.08) return 2.0;                                        // station
-    if (u < 0.22) return 2.0 + smoothstep(0.08, 0.22, u) * 10.0;     // conveyor 1
-    if (u < 0.34) return 12.0 - smoothstep(0.22, 0.34, u) * 5.0;     // baby drop
-    if (u < 0.40) return 7.0;                                        // meander
-    if (u < 0.58) return 7.0 + smoothstep(0.40, 0.58, u) * 25.0;     // conveyor 2
-    if (u < 0.62) return 32.0;                                       // the crest
-    if (u < 0.74) {                                                  // splashdown
-        float d = smoothstep(0.62, 0.74, u);
-        return 32.0 - d * d * 30.0;
-    }
-    return 2.0;                                                      // run-out
-}
-
-vec3 trackPoint(float s) {
-    float th = fract(s / CIRCUIT) * TAU;
-    float r = LAP_R * (1.0 + 0.22 * sin(th * 2.0 + iSeed * 6.3)
-                           + 0.11 * sin(th * 3.0 + 1.4));
-    return vec3(r * sin(th), rideHeight(s), r * cos(th));
-}
-
-float trackRoll(float s) {
-    vec3 a = trackPoint(s - 9.0), b = trackPoint(s), c = trackPoint(s + 9.0);
-    vec2 d1 = normalize(b.xz - a.xz), d2 = normalize(c.xz - b.xz);
-    float turn = d1.x * d2.y - d1.y * d2.x;
-    // A flume's water does not bank; only the channel leans a little.
-    return clamp(turn * 8.0, -1.0, 1.0) * 0.20;
-}
-
-struct Cam { vec3 pos; vec3 right; vec3 up; vec3 fwd; };
-
-Cam rideCam(float s, float rock) {
-    Cam c;
-    vec3 here = trackPoint(s);
-    vec3 tangent = normalize(trackPoint(s + 1.5) - trackPoint(s - 1.5));
-    c.fwd = normalize(mix(tangent, normalize(trackPoint(s + 24.0) - here), 0.5));
-    float roll = trackRoll(s) + sin(iTime * 1.7) * 0.03 * (0.4 + rock);
-    vec3 worldUp = vec3(sin(roll), cos(roll), 0.0);
-    c.right = normalize(cross(c.fwd, worldUp));
-    c.up = cross(c.right, c.fwd);
-    c.pos = here + c.up * 1.35 + c.up * rock * 0.12;
-    return c;
-}
-
-bool project(Cam c, vec3 P, out vec2 sp, out float depth) {
-    vec3 q = P - c.pos;
-    float z = dot(q, c.fwd);
+// World point -> screen. Fragment-independent, so it is called once per node
+// per step rather than once per structural member.
+bool project(vec3 P, out vec2 sp, out float depth) {
+    vec3 q = P - iCamPos;
+    float z = dot(q, iCamFwd);
     if (z < 0.35) return false;
-    sp = vec2(dot(q, c.right), dot(q, c.up)) / z;
+    float iz = 1.0 / z;
+    sp = vec2(dot(q, iCamRight), dot(q, iCamUp)) * iz;
     depth = z;
     return true;
 }
@@ -149,20 +131,29 @@ float segDist(vec2 p, vec2 a, vec2 b) {
     float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
     return length(pa - ba * h);
 }
-void strut(inout vec3 col, Cam cam, vec2 p, vec3 A, vec3 B,
-           float radius, vec3 c, float glow) {
-    vec2 a, b; float da, db;
-    if (!project(cam, A, a, da)) return;
-    if (!project(cam, B, b, db)) return;
-    float w = clamp(radius / min(da, db), 0.0007, 0.09);
+
+// One structural member, already projected. The screen-space bounding-box
+// reject in front is what makes a 46-step march affordable: for any given
+// pixel almost every member is nowhere near it.
+void seg2(inout vec3 col, vec2 p, vec2 a, vec2 b, float w, vec3 c, float glow) {
+    if (p.x < min(a.x, b.x) - w || p.x > max(a.x, b.x) + w ||
+        p.y < min(a.y, b.y) - w || p.y > max(a.y, b.y) + w) return;
     float d = segDist(p, a, b);
     col = mix(col, c, smoothstep(w, w * 0.45, d));
     if (glow > 0.0) col += c * smoothstep(w * 0.55, 0.0, d) * glow;
 }
 
+// A member given in world space, for nodes outside the shared per-step set.
+void strut(inout vec3 col, vec2 p, vec3 A, vec3 B, float radius, vec3 c, float glow) {
+    vec2 a, b; float da, db;
+    if (!project(A, a, da)) return;
+    if (!project(B, b, db)) return;
+    seg2(col, p, a, b, clamp(radius / min(da, db), 0.0007, 0.09), c, glow);
+}
+
 // Coverage of a screen-space triangle: 1 inside, 0 outside. The three edge
-// cross-products agree in sign only for points within the triangle, which is
-// true whichever way round the triangle was wound.
+// cross-products agree in sign only for points within the triangle, whichever
+// way round it was wound.
 float triCover(vec2 p, vec2 a, vec2 b, vec2 c) {
     float d1 = (p.x - b.x) * (a.y - b.y) - (a.x - b.x) * (p.y - b.y);
     float d2 = (p.x - c.x) * (b.y - c.y) - (b.x - c.x) * (p.y - c.y);
@@ -174,24 +165,18 @@ float triCover(vec2 p, vec2 a, vec2 b, vec2 c) {
 
 // A flat quad in world space, filled as two triangles. Returns the coverage so
 // the caller can shade what it just painted.
-float quadFill(inout vec3 col, Cam cam, vec2 p, vec3 A, vec3 B, vec3 C, vec3 D,
+float quadFill(inout vec3 col, vec2 p, vec3 A, vec3 B, vec3 C, vec3 D,
                vec3 c, float alpha) {
     vec2 a, b, cc, d; float za, zb, zc, zd;
-    if (!project(cam, A, a, za)) return 0.0;
-    if (!project(cam, B, b, zb)) return 0.0;
-    if (!project(cam, C, cc, zc)) return 0.0;
-    if (!project(cam, D, d, zd)) return 0.0;
+    if (!project(A, a, za) || !project(B, b, zb) ||
+        !project(C, cc, zc) || !project(D, d, zd)) return 0.0;
+    if (p.x < min(min(a.x, b.x), min(cc.x, d.x)) ||
+        p.x > max(max(a.x, b.x), max(cc.x, d.x)) ||
+        p.y < min(min(a.y, b.y), min(cc.y, d.y)) ||
+        p.y > max(max(a.y, b.y), max(cc.y, d.y))) return 0.0;
     float cov = max(triCover(p, a, b, cc), triCover(p, a, cc, d));
     col = mix(col, c, cov * alpha);
     return cov;
-}
-
-void frameAt(float s, out vec3 lat, out vec3 nrm) {
-    float roll = trackRoll(s);
-    vec3 tangent = normalize(trackPoint(s + 1.5) - trackPoint(s - 1.5));
-    vec3 worldUp = vec3(sin(roll), cos(roll), 0.0);
-    lat = normalize(cross(tangent, worldUp));
-    nrm = cross(lat, tangent);
 }
 
 vec3 skyColour(vec2 p, float tb) {
@@ -200,32 +185,31 @@ vec3 skyColour(vec2 p, float tb) {
     if (iSky < 0.34)      { lo = vec3(0.98, 0.72, 0.40); hi = vec3(0.05, 0.20, 0.42); }
     else if (iSky < 0.67) { lo = vec3(0.55, 0.88, 0.85); hi = vec3(0.04, 0.16, 0.46); }
     else                  { lo = vec3(0.75, 0.35, 0.62); hi = vec3(0.03, 0.06, 0.24); }
-    vec3 col = mix(lo, hi, pow(up, 0.8));
-    col = mix(col, palette(iHue + up * 0.3), 0.20 + iMid * 0.12);
-    float band = sin(p.y * 16.0 - tb * 0.18 + sin(p.x * 1.8) * 1.4);
-    col += vec3(1.0, 0.95, 0.85) * smoothstep(0.90, 1.0, band)
-         * (0.08 + iMid * 0.16) * (1.0 - up);
-    col += mix(vec3(1.0, 0.88, 0.55), palette(iHue + 0.12), 0.30)
-         * exp(-length(p - vec2(-0.34, 0.16 - iGrade * 0.5)) * 5.5)
-         * (0.8 + iBass * 0.6);
+    vec3 col = mix(lo, hi, pow(up, 0.75));
+    col = mix(col, palette(iHue + up * 0.3), 0.22 + iMid * 0.10);
+    float band = sin(p.y * 22.0 - tb * 0.25 + sin(p.x * 2.0) * 1.2);
+    col += vec3(1.0, 0.85, 0.75) * smoothstep(0.90, 1.0, band)
+         * (0.10 + iMid * 0.20) * (1.0 - up);
+    vec2 sunP = vec2(0.30, 0.10 - iGrade * 0.5);
+    col += mix(vec3(1.0, 0.75, 0.35), palette(iHue + 0.1), 0.35)
+         * exp(-length(p - sunP) * 5.0) * (0.9 + iBass * 0.7);
     return col;
 }
 
 void main() {
     float A = iResolution.x / max(iResolution.y, 1.0);
     float tb = mod(iTime, 300.0);
-    float rock = iBass * 0.5 + iPunch * 0.7;
+    float shake = iBass * 0.5 + iPunch * 0.8;
     vec2 p = (v_uv - 0.5) * vec2(A, 1.0) / max(iZoom, 0.05);
-    p += vec2(sin(tb * 21.0), sin(tb * 17.0 + 0.7)) * rock * 0.004;
+    p += vec2(sin(tb * 47.0), sin(tb * 39.0 + 1.1)) * shake * 0.006;
 
-    Cam cam = rideCam(iTravel, rock);
     vec3 col = skyColour(p, tb);
 
-    vec3 rd = normalize(cam.fwd + p.x * cam.right + p.y * cam.up);
-    if (rd.y < -0.0015 && cam.pos.y > 0.2) {
-        float td = -cam.pos.y / rd.y;
+    vec3 rd = normalize(iCamFwd + p.x * iCamRight + p.y * iCamUp);
+    if (rd.y < -0.0015 && iCamPos.y > 0.2) {
+        float td = -iCamPos.y / rd.y;
         if (td > 0.0 && td < 900.0) {
-            vec3 g = cam.pos + rd * td;
+            vec3 g = iCamPos + rd * td;
             // The catch pool the whole ride stands in.
             vec3 gnd = mix(vec3(0.020, 0.070, 0.095), palette(iHue + 0.52), 0.20);
             float rip = sin(g.x * 0.35 + tb * 1.1) * sin(g.z * 0.31 - tb * 0.9);
@@ -238,76 +222,134 @@ void main() {
         }
     }
 
+    // ── the structure, marched far to near so crests occlude what is beyond ──
     vec3 timber = mix(vec3(0.36, 0.24, 0.15), palette(iHue + 0.58), 0.30);
     vec3 capCol = mix(vec3(0.62, 0.46, 0.28), palette(iHue + 0.20), 0.35);
     vec3 waterC = mix(vec3(0.05, 0.33, 0.46), palette(iHue + 0.48), 0.28);
+    vec3 flowC  = mix(vec3(0.45, 0.90, 1.0), palette(iHue + 0.3), 0.30);
+    const float HALFW = 2.0, WALL = 1.5, DECK = 1.0;
 
-    const float NEAR = 1.8, FAR = 400.0, HALFW = 2.0, WALL = 1.5, DECK = 1.0;
     for (int i = STEPS - 1; i >= 0; i--) {
-        float f0 = float(i) / float(STEPS);
-        float f1 = float(i + 1) / float(STEPS);
-        float s0 = iTravel + NEAR + f0 * f0 * FAR;
-        float s1 = iTravel + NEAR + f1 * f1 * FAR;
-        vec3 c0 = trackPoint(s0), c1 = trackPoint(s1);
-        vec3 lat0, nrm0, lat1, nrm1;
-        frameAt(s0, lat0, nrm0);
-        frameAt(s1, lat1, nrm1);
-        float fade = 1.0 - f0 * 0.70;
+        vec3 c0 = iP[i].xyz,     c1 = iP[i + 1].xyz;
+        vec3 l0 = iL[i].xyz,     l1 = iL[i + 1].xyz;
+        vec3 n0 = iN[i].xyz,     n1 = iN[i + 1].xyz;
+        float s0 = iP[i].w, s1 = iP[i + 1].w;
 
+        // Ties and bents sit at fixed spacings along the track, and a section
+        // carries one when its span crosses that spacing. Testing the section's
+        // own s against a square wave instead -- what 0.2.0 did -- ties the
+        // structure's density to the sampling: near sections are two metres
+        // apart, so three or four in a row would each stack a bent in almost
+        // the same place, and far sections would each grow one 30 m long.
+        bool hasTie  = floor(s1 / 1.8) > floor(s0 / 1.8);
+        bool hasBent = floor(s1 / 14.0) > floor(s0 / 14.0) && c0.y > 4.0;
+
+        // Reject the whole section if this pixel is nowhere near it. A
+        // section's members all live within about 3.6 m of its centreline, so
+        // that radius over the near depth bounds them on screen.
+        vec2 a, b; float da, db;
+        bool va = project(c0, a, da), vb = project(c1, b, db);
+        bool inSection = true;
+        if (va && vb) {
+            float rad = 3.6 / max(min(da, db), 0.5);
+            inSection = !(p.x < min(a.x, b.x) - rad || p.x > max(a.x, b.x) + rad ||
+                          p.y < min(a.y, b.y) - rad || p.y > max(a.y, b.y) + rad);
+        } else if (!va && !vb) {
+            inSection = false;
+        }
+        // Reject the bent against the section's own projected point before
+        // projecting its four corners. A long far section always spans a bent
+        // spacing, so without this every far section pays four projections per
+        // pixel whether or not the bent is anywhere near it -- which was most
+        // of the frame. The bent hangs below the track within about 3 m of it.
+        if (hasBent && va) {
+            float bw = 4.0 / max(da, 0.5);
+            hasBent = !(p.x < a.x - bw || p.x > a.x + bw || p.y > a.y + bw);
+        }
+        if (!inSection && !hasBent) continue;
+
+        float f0 = float(i) / float(STEPS);
+        float fade = 1.0 - f0 * 0.75;
+        float glow = (0.30 + iTreble * 0.9) * fade;
+
+        if (inSection) {
         // Outer faces of the two side walls, then the water between them.
         for (int w = -1; w <= 1; w += 2) {
             float sw = float(w);
-            vec3 lo0 = c0 + lat0 * (HALFW * sw) - nrm0 * DECK;
-            vec3 lo1 = c1 + lat1 * (HALFW * sw) - nrm1 * DECK;
-            vec3 hi0 = c0 + lat0 * (HALFW * sw) + nrm0 * WALL;
-            vec3 hi1 = c1 + lat1 * (HALFW * sw) + nrm1 * WALL;
-            vec3 face = timber * (0.35 + fade * 0.85)
-                      * (w < 0 ? 0.82 : 1.0);   // one side catches the light
-            quadFill(col, cam, p, lo0, lo1, hi1, hi0, face, 1.0);
-            // Cap rail along the top of the wall.
-            strut(col, cam, p, hi0, hi1, 0.13, capCol * (0.4 + fade * 0.9), 0.0);
-            // Plank lines, near sections only.
-            if (f0 < 0.30 && mod(floor(s0 * 1.1), 1.0) < 0.5) {
-                strut(col, cam, p, lo0, hi0, 0.05, timber * 0.55 * fade, 0.0);
+            vec3 lo0 = c0 + l0 * (HALFW * sw) - n0 * DECK;
+            vec3 lo1 = c1 + l1 * (HALFW * sw) - n1 * DECK;
+            vec3 hi0 = c0 + l0 * (HALFW * sw) + n0 * WALL;
+            vec3 hi1 = c1 + l1 * (HALFW * sw) + n1 * WALL;
+            quadFill(col, p, lo0, lo1, hi1, hi0,
+                     timber * (0.35 + fade * 0.85) * (w < 0 ? 0.82 : 1.0), 1.0);
+            strut(col, p, hi0, hi1, 0.13, capCol * (0.4 + fade * 0.9), 0.0);
+            if (f0 < 0.30 && hasTie) {
+                strut(col, p, lo0, hi0, 0.05, timber * 0.55 * fade, 0.0);
             }
         }
 
-        vec3 wl0 = c0 - lat0 * HALFW, wr0 = c0 + lat0 * HALFW;
-        vec3 wl1 = c1 - lat1 * HALFW, wr1 = c1 + lat1 * HALFW;
-        float cov = quadFill(col, cam, p, wl0, wr0, wr1, wl1,
+        float cov = quadFill(col, p, c0 - l0 * HALFW, c0 + l0 * HALFW,
+                             c1 + l1 * HALFW, c1 - l1 * HALFW,
                              waterC * (0.45 + fade * 0.9), 1.0);
         if (cov > 0.0) {
             // Surface streaming past at the speed the log is actually doing.
             float flow = sin(s0 * 0.9 - iTravel * 0.55 + p.x * 5.0);
-            col += mix(vec3(0.45, 0.90, 1.0), palette(iHue + 0.3), 0.30)
-                 * smoothstep(0.55, 1.0, flow) * cov * fade
+            col += flowC * smoothstep(0.55, 1.0, flow) * cov * fade
                  * (0.14 + iBass * 0.35);
             col += vec3(0.9, 0.98, 1.0) * cov
                  * step(0.994, hash21(floor(vec2(p.x * 210.0,
                                                  p.y * 210.0 + iTravel * 3.0))))
                  * (0.35 + iTreble * 1.1) * iGlitter;
         }
+        }
 
-        // Timber trestle bents: paired legs, sill beam and X-bracing.
-        if (mod(floor(s0 * 0.09), 1.0) < 0.5 && c0.y > 3.0) {
-            vec3 footL = vec3((c0 - lat0 * 2.7).x, 0.0, (c0 - lat0 * 2.7).z);
-            vec3 footR = vec3((c0 + lat0 * 2.7).x, 0.0, (c0 + lat0 * 2.7).z);
-            vec3 topL = c0 - lat0 * 2.2 - nrm0 * DECK;
-            vec3 topR = c0 + lat0 * 2.2 - nrm0 * DECK;
-            vec3 midL = mix(topL, footL, 0.55), midR = mix(topR, footR, 0.55);
-            vec3 legC = timber * (0.30 + fade * 0.8);
-            strut(col, cam, p, topL, footL, 0.16, legC, 0.0);
-            strut(col, cam, p, topR, footR, 0.16, legC, 0.0);
-            strut(col, cam, p, topL, topR, 0.13, legC * 1.1, 0.0);
-            strut(col, cam, p, midL, midR, 0.10, legC * 0.9, 0.0);
-            strut(col, cam, p, topL, midR, 0.09, legC * 0.85, 0.0);
-            strut(col, cam, p, topR, midL, 0.09, legC * 0.85, 0.0);
+        // Support bents: paired legs, a cross brace and footers. A bent reaches
+        // all the way to grade, far outside its section's screen box, so it
+        // carries its own -- four corners projected, then one box test gates
+        // the whole assembly. Letting it bypass the cull instead cost 68% of
+        // the frame.
+        if (hasBent) {
+            vec3 baseL = vec3((c0 - l0 * 2.7).x, 0.0, (c0 - l0 * 2.7).z);
+            vec3 baseR = vec3((c0 + l0 * 2.7).x, 0.0, (c0 + l0 * 2.7).z);
+            vec3 topL = c0 - n0 * DECK - l0 * 2.2;
+            vec3 topR = c0 - n0 * DECK + l0 * 2.2;
+            vec2 bl, br, tl, tr; float z0, z1, z2, z3;
+            bool ok = project(baseL, bl, z0) && project(baseR, br, z1)
+                   && project(topL, tl, z2) && project(topR, tr, z3);
+            bool draw = true;
+            if (ok) {
+                float bw = 0.3 / max(min(min(z0, z1), min(z2, z3)), 0.5);
+                vec2 lo = min(min(bl, br), min(tl, tr)) - bw;
+                vec2 hi = max(max(bl, br), max(tl, tr)) + bw;
+                draw = !(p.x < lo.x || p.x > hi.x || p.y < lo.y || p.y > hi.y);
+            }
+            if (draw && ok) {
+                // Project the six distinct nodes once and draw in screen space.
+                // Seven world-space members would re-project shared nodes 14
+                // times over, and projection is the bent's dominant cost.
+                vec2 ml, mr; float z4, z5;
+                project(mix(topL, baseL, 0.5), ml, z4);
+                project(mix(topR, baseR, 0.5), mr, z5);
+                vec3 legCol = timber * (0.30 + fade * 0.8);
+                float wL = clamp(0.17 / min(z2, z0), 0.0007, 0.09);
+                float wR = clamp(0.17 / min(z3, z1), 0.0007, 0.09);
+                float wX = clamp(0.10 / min(min(z2, z3), min(z4, z5)), 0.0007, 0.09);
+                float wF = clamp(0.09 / min(min(z4, z5), min(z0, z1)), 0.0007, 0.09);
+                seg2(col, p, tl, bl, wL, legCol, 0.0);
+                seg2(col, p, tr, br, wR, legCol, 0.0);
+                // Cross bracing, and a horizontal tie halfway down.
+                seg2(col, p, tl, mr, wX, legCol * 0.9, 0.0);
+                seg2(col, p, tr, ml, wX, legCol * 0.9, 0.0);
+                seg2(col, p, ml, mr, wX, legCol * 0.9, 0.0);
+                seg2(col, p, ml, br, wF, legCol * 0.85, 0.0);
+                seg2(col, p, mr, bl, wF, legCol * 0.85, 0.0);
+            }
         }
     }
 
     // The log's own hull filling the bottom of frame, and its bow wave. The
-    // hull edge is a shallow parabola, so the nose reads as rounded rather than
-    // as a wedge across the channel.
+    // hull edge is a shallow parabola, so the nose reads as rounded rather
+    // than as a wedge across the channel.
     float hullEdge = (p.y + 0.35) + p.x * p.x * 0.26;
     float hull = smoothstep(0.012, -0.012, hullEdge);
     vec3 hullCol = timber * 0.48 + palette(iHue + 0.1) * 0.06
@@ -329,9 +371,10 @@ void main() {
             float ph = fract(tb * 0.8 + fi * 0.137);
             vec2 dp = vec2((hash21(vec2(fi, 1.0)) - 0.5) * 1.5,
                            -0.45 + ph * 1.1 - ph * ph * 0.55);
-            col += vec3(0.85, 0.96, 1.0)
-                 * exp(-dot(p - dp, p - dp) * 1100.0)
-                 * (1.0 - ph) * splash * (0.8 + iTreble * 0.8);
+            vec2 dv = p - dp;
+            float q = dot(dv, dv);
+            if (q < 0.006) col += vec3(0.85, 0.96, 1.0) * exp(-q * 1100.0)
+                                * (1.0 - ph) * splash * (0.8 + iTreble * 0.8);
         }
     }
 
@@ -344,30 +387,64 @@ void main() {
 """
 
 
-def _smoothstep(a: float, b: float, x: float) -> float:
-    t = min(1.0, max(0.0, (x - a) / max(b - a, 1e-6)))
+def _sstep(a: float, b: float, x: np.ndarray) -> np.ndarray:
+    """Vectorised GLSL smoothstep."""
+    t = np.clip((x - a) / max(b - a, 1e-6), 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
 
 
-def ride_height(s: float) -> float:
-    """CPU mirror of the shader's rideHeight, for the physics integrator."""
+def ride_height(s: np.ndarray) -> np.ndarray:
+    """Height above grade at distance ``s`` along the circuit.
+
+    Every branch meets its neighbour and the last value equals the first, so
+    there is no step at the lap seam -- the 1.x profile jumped 4 m there and
+    spiked the speed integrator once per lap.
+    """
     u = (s / CIRCUIT) % 1.0
-    if u < 0.08:
-        return 2.0
-    if u < 0.22:
-        return 2.0 + _smoothstep(0.08, 0.22, u) * 10.0
-    if u < 0.34:
-        return 12.0 - _smoothstep(0.22, 0.34, u) * 5.0
-    if u < 0.40:
-        return 7.0
-    if u < 0.58:
-        return 7.0 + _smoothstep(0.40, 0.58, u) * 25.0
-    if u < 0.62:
-        return 32.0
-    if u < 0.74:
-        d = _smoothstep(0.62, 0.74, u)
-        return 32.0 - d * d * 30.0
-    return 2.0
+    d_fall = _sstep(0.62, 0.74, u)
+    return np.select(
+        [u < 0.08, u < 0.22, u < 0.34, u < 0.40, u < 0.58, u < 0.62, u < 0.74],
+        [np.full_like(u, 2.0),                              # station
+         2.0 + _sstep(0.08, 0.22, u) * 10.0,                # first conveyor
+         12.0 - _sstep(0.22, 0.34, u) * 5.0,                # baby drop
+         np.full_like(u, 7.0),                              # meander
+         7.0 + _sstep(0.40, 0.58, u) * 25.0,                # big conveyor
+         np.full_like(u, 32.0),                             # the crest
+         32.0 - d_fall * d_fall * 30.0],                    # splashdown
+        np.full_like(u, 2.0))                               # run-out
+
+
+def track_point(s: np.ndarray, seed: float) -> np.ndarray:
+    """The circuit's centreline: a closed curve, so coordinates stay bounded."""
+    th = ((s / CIRCUIT) % 1.0) * TAU
+    r = LAP_R * (1.0 + 0.22 * np.sin(th * 2.0 + seed * 6.3)
+                     + 0.11 * np.sin(th * 3.0 + 1.4))
+    return np.stack([r * np.sin(th), ride_height(s), r * np.cos(th)], axis=-1)
+
+
+def _unit(v: np.ndarray) -> np.ndarray:
+    return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-6)
+
+
+def track_roll(s: np.ndarray, seed: float) -> np.ndarray:
+    """Bank angle, taken from the actual plan curvature rather than a sine."""
+    a = track_point(s - 9.0, seed)
+    b = track_point(s, seed)
+    c = track_point(s + 9.0, seed)
+    d1 = _unit(b[..., ::2] - a[..., ::2])
+    d2 = _unit(c[..., ::2] - b[..., ::2])
+    turn = d1[..., 0] * d2[..., 1] - d1[..., 1] * d2[..., 0]
+    # A flume's water does not bank; only the channel leans a little.
+    return np.clip(turn * 8.0, -1.0, 1.0) * 0.20
+
+
+def track_frame(s: np.ndarray, seed: float) -> tuple[np.ndarray, np.ndarray]:
+    """Lateral and normal unit vectors at ``s``, banked with the track."""
+    roll = track_roll(s, seed)
+    tan = _unit(track_point(s + 1.5, seed) - track_point(s - 1.5, seed))
+    up = np.stack([np.sin(roll), np.cos(roll), np.zeros_like(roll)], axis=-1)
+    lat = _unit(np.cross(tan, up))
+    return lat, np.cross(lat, tan)
 
 
 def on_conveyor(s: float) -> bool:
@@ -410,10 +487,61 @@ class LogFlume(BaseEffect):
         self._sky = float(self.rng.uniform(0.0, 1.0))
         self._travel = float(self.rng.uniform(0.0, CIRCUIT))
         self._grade = 0.0
+        self._shake = 0.0
         self._splash = 0.0
 
+        # March table, filled in place each frame and uploaded as uniforms.
+        f = np.arange(STEPS + 1, dtype=np.float64) / STEPS
+        self._march_f2 = f * f
+        self._tbl_p = np.zeros((STEPS + 1, 4), dtype='f4')
+        self._tbl_l = np.zeros((STEPS + 1, 4), dtype='f4')
+        self._tbl_n = np.zeros((STEPS + 1, 4), dtype='f4')
+        self._probe = np.zeros(3, dtype=np.float64)
+        self._build_march()
+
+    def _build_march(self) -> None:
+        """Sample the circuit ahead of the train and place the camera on it.
+
+        Everything the shader needs about the track is produced here, once per
+        frame: the fragment program has no track model in it at all. That is
+        both the performance fix (the geometry was being re-derived per pixel)
+        and the correctness one -- there is a single source of truth for the
+        circuit rather than a GLSL copy and a Python copy free to drift.
+        """
+        s = self._travel + NEAR + self._march_f2 * FAR
+        pts = track_point(s, self._seed)
+        lat, nrm = track_frame(s, self._seed)
+        self._tbl_p[:, :3] = pts
+        self._tbl_p[:, 3] = s
+        self._tbl_l[:, :3] = lat
+        self._tbl_n[:, :3] = nrm
+
+        # The camera rides the curve: position from it, orientation from its
+        # tangent, roll from its lateral curvature.
+        t = np.array([self._travel], dtype=np.float64)
+        here = track_point(t, self._seed)[0]
+        tangent = _unit(track_point(t + 1.5, self._seed)
+                        - track_point(t - 1.5, self._seed))[0]
+        ahead = _unit(track_point(t + 22.0, self._seed)[0] - here)
+        fwd = _unit(tangent + (ahead - tangent) * 0.5)
+        roll = float(track_roll(t, self._seed)[0])
+        world_up = np.array([math.sin(roll), math.cos(roll), 0.0])
+        right = _unit(np.cross(fwd, world_up))
+        up = np.cross(right, fwd)
+        shake = self._shake
+        pos = here + up * 1.9 + right * shake * 0.25 + up * shake * 0.18
+
+        p = self._prog
+        p['iP'].write(self._tbl_p.tobytes())
+        p['iL'].write(self._tbl_l.tobytes())
+        p['iN'].write(self._tbl_n.tobytes())
+        p['iCamPos'].value = tuple(float(x) for x in pos)
+        p['iCamRight'].value = tuple(float(x) for x in right)
+        p['iCamUp'].value = tuple(float(x) for x in up)
+        p['iCamFwd'].value = tuple(float(x) for x in fwd)
+
     def update(self, dt: float, audio: AudioData) -> None:
-        """Belt on the conveyors, gravity elsewhere, drag on the run-out."""
+        """Advance the train by conserving energy, and track the audio."""
         super().update(dt, audio)
         react = max(0.05, float(self.parameters['reactivity']))
         self._bass = float(np.clip(audio.bass_n * react, 0.0, 2.0))
@@ -424,14 +552,18 @@ class LogFlume(BaseEffect):
             self._punch = 1.0
         self._beat = max(0.0, self._beat - dt * 5.0)
         self._punch = max(0.0, self._punch - dt * 2.2)
+        self._shake = ((self._bass * 0.5 + self._punch * 0.8)
+                       )
 
-        u = (self._travel / CIRCUIT) % 1.0
-        h = ride_height(self._travel)
         ahead = 5.0
-        self._grade = float(np.clip(
-            (ride_height(self._travel + ahead) - ride_height(self._travel - ahead))
-            / (2 * ahead), -1.5, 1.5))
+        self._probe[:] = (self._travel - ahead, self._travel, self._travel + ahead)
+        heights = ride_height(self._probe)
+        h = float(heights[1])
+        self._grade = float(np.clip((heights[2] - heights[0]) / (2 * ahead), -1.5, 1.5))
 
+        # Energy conservation: everything the train has, it got by falling.
+        # On the lift the chain sets the pace instead.
+        u = (self._travel / CIRCUIT) % 1.0
         if on_conveyor(self._travel):
             v = self._CONVEYOR_SPEED
         else:
@@ -447,11 +579,12 @@ class LogFlume(BaseEffect):
         self._splash = max(0.0, self._splash - dt * 0.9)
 
         speed = max(0.05, float(self.parameters['speed']))
+        # Travel stays inside one lap forever, so no coordinate ever grows.
         self._travel = (self._travel
                         + dt * speed * v * (0.8 + self._bass * 0.5)) % CIRCUIT
 
     def render(self) -> None:
-        """Upload ride state and draw the view from the log's front seat."""
+        """Upload ride state and draw the view from the front car."""
         p = self._prog
         p['iTime'].value = float(self.time)
         p['iResolution'].value = (float(self.width), float(self.height))
@@ -464,11 +597,11 @@ class LogFlume(BaseEffect):
         p['iZoom'].value = max(0.05, float(self.parameters['zoom']))
         p['iGlitter'].value = max(0.0, float(self.parameters['glitter']))
         p['iTravel'].value = float(self._travel)
-        p['iSeed'].value = self._seed
         p['iSky'].value = self._sky
         p['iGrade'].value = float(self._grade)
         p['iSplash'].value = float(self._splash)
         p['iSplashGain'].value = max(0.0, float(self.parameters['splash_gain']))
+        self._build_march()
         self._vao.render(moderngl.TRIANGLE_STRIP)
 
     def destroy(self) -> None:
