@@ -1,9 +1,9 @@
 # effects-rollercoast — Unicorn Viz effect pack
 
-**Version 0.3.0**
+**Version 0.4.0**
 
 Ride effects: First Drop, Corkscrew, Night Coaster, Mine Train, Coaster Cam,
-Demon Drop, Log Flume.
+Log Flume.
 
 Each effect subclasses `unicornviz.effects.base.BaseEffect` and is auto-discovered.
 
@@ -23,18 +23,19 @@ the rest of the ride across the infield — which is most of what makes a coaste
 read as a coaster rather than as a corridor. The height profile is continuous
 across the lap seam, so nothing steps or spikes once per lap.
 
-**Speed is energy.** Away from a lift, a train's speed is `v = sqrt(2 g (H_top -
-h))` — it got everything it has by falling — so it crawls over summits and
-screams through valleys because the geometry demands it, not because a curve
-says so. Lifts, chains, conveyors, cable hoists and brake fins each set their
-own pace where a real ride's would. Audio rides on top of that rather than
-replacing it, so each ride keeps its own physical rhythm.
+**Speed follows energy, on a band that never creeps.** A train's pace still
+comes from how far it has fallen — that shape is what sells a drop — but the
+raw energy curve `v = sqrt(2 g (H_top - h))` is physically right and visually
+wrong here: it parks the ride on a chain lift for a third of the lap and lets
+it creep over every summit. The curve is remapped onto a band running about
+0.78x to 1.5x of a cruising pace, and the result passes through a first-order
+lag, so no seam between profile branches and no handover between the chain and
+gravity can step the speed. Audio rides on top of that.
 
 **The structure is a real one.** Each section carries running rails over a box
 spine, tied by zig-zag truss lacing and cross ties, standing on braced support
 bents with footers. Rides that need something else build it: Mine Train's timber
-hoops, Demon Drop's four-legged lattice mast, Log Flume's trestle bents and
-filled-quad trough.
+hoops and Log Flume's trestle bents and filled-quad trough.
 
 ## Effects
 
@@ -52,22 +53,55 @@ filled-quad trough.
   watching a train whose cars each sit at their own point on the curve, so the
   consist stretches on the drops and rolls through the banking one car at a
   time.
-- **Demon Drop** — the freefall tower. The plan shape is phase-warped so the
-  track can go vertical without the ride frame degenerating: the car hoists up a
-  lattice mast, **hangs** at the crown tipped forward over the drop, falls, and
-  curves out onto the brake run.
 - **Log Flume** — a water circuit built from surfaces rather than lines: two
   conveyors, a meander, and a splashdown, seen from the front seat of the log
   with the trough painted as filled quads around you.
 
 ## Tweakables
 
-All seven take `speed`, `zoom`, `reactivity` and `glitter`, plus one of their
+All six take `speed`, `zoom`, `reactivity` and `glitter`, plus one of their
 own: `drop_force` (First Drop), `roll_force` (Corkscrew), `neon_gain` (Night
-Coaster), `torch_gain` (Mine Train), `cam_offset` (Coaster Cam), `hang_tension`
-(Demon Drop), `splash_gain` (Log Flume).
+Coaster), `torch_gain` (Mine Train), `cam_offset` (Coaster Cam), `splash_gain`
+(Log Flume).
 
 ## Changelog
+
+- **0.4.0** — the rides no longer creep, and the backdrops pick up where the
+  track stops carrying the frame.
+
+  *Pace.* The energy model was physically faithful and no fun: **43% of every
+  lap ran under 12 m/s**, with a 4.7x spread between the crest and the bottom of
+  the drop and laps of 59-87 seconds. Speed still comes from how far the train
+  has fallen, but that curve is now remapped onto a band that never creeps and
+  smoothed with a lag. Measured over two full laps per ride: **22.9-39.5 m/s
+  (1.73x), 0% of the lap under 12 m/s, laps of 33-37 s**.
+
+  *Smoothness.* The chain-to-gravity handover was a hard boolean, so entering
+  the lift stepped the target 16 m/s in one frame — **53.8 m/s²** through the
+  lag, which is the jerk on hills and inclines. The handover is now a smooth
+  window and peak acceleration is **13.6 m/s²**, about 1.4 g, which is a figure
+  a real coaster actually pulls and is meant to be felt.
+
+  *Atmosphere.* Every ride carries an `iCruise` signal — 1 on a lift, over a
+  crest and along the flats, 0 in a plunge — and the backdrop swells with it:
+  light sweeping across the sky, a shockwave thrown out of the vanishing point
+  on each beat, and embers riding the airflow. Speed lines now stretch and
+  brighten with how fast the ride is genuinely going, and the beat lands a short
+  punch of field of view.
+
+  *Mine Train* gets the biggest immersion change: its rock was a static screen
+  texture, so the walls never moved while the rails ran underneath them. The
+  bore is now textured in log-polar space and scrolled along the radial axis,
+  which is exactly the outward expansion perspective produces, so the wall
+  really flies past — with ore veins in it that light up on the mids. *Night
+  Coaster* gets a ring of light running out across the midway on the beat.
+
+  Particle placement (embers, sparks, firework shells) moved to the CPU. These
+  shaders sit on an occupancy cliff: with the per-pixel version, the march loop
+  itself measured twice as slow, and removing either the fireworks or the star
+  field alone changed nothing while removing both halved the frame.
+
+  **Demon Drop is retired** at the owner's request.
 
 - **0.3.0** — the pack ran at 8-11 fps at 1080p; it now runs at 50-104. The
   cause was structural: the fragment shader carried the whole track model, so

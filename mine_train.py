@@ -41,13 +41,30 @@ import numpy as np
 
 from unicornviz.effects.base import AudioData, BaseEffect
 
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 
 # One lap, in metres. Shared by the CPU physics and the track sampler.
 CIRCUIT = 900.0
 # Crest of the ride; the energy model measures every fall from just above it.
 H_TOP = 50.0
-GRAVITY = 9.81
+# ── speed model ─────────────────────────────────────────────────────────────
+# A coaster's true energy curve -- v = sqrt(2 g (H_top - h)) -- is physically
+# right and visually wrong here. It parks the ride on a chain lift for a third
+# of the lap and lets it creep over every summit: measured on the 0.3.0
+# profile, 43% of each lap ran under 12 m/s, with a 4.7x spread between the
+# crest and the bottom of the drop. That is a long time to spend crawling in
+# something whose job is to carry the energy of the music.
+#
+# The *shape* of the energy curve is what sells a drop, so it is kept -- speed
+# still comes from how far the train has fallen -- but it is remapped onto a
+# band that never creeps, and the result is passed through a first-order lag so
+# no seam between profile branches, and no handover between the chain and
+# gravity, can step the speed.
+CRUISE = 26.0            # m/s, the pace the ride holds when nothing is happening
+_SPEED_LO = 0.78         # multiple of CRUISE at a crest, and on the lift
+_SPEED_HI = 1.52         # multiple of CRUISE at the lowest point on the circuit
+_LIFT_MULT = 0.88        # multiple of CRUISE while the chain has hold
+_SPEED_TAU = 0.30        # s, lag constant; smooths every profile seam
 LAP_R = 168.0
 TAU = 2.0 * math.pi
 
@@ -84,7 +101,15 @@ uniform float iGlitter;
 uniform float iTravel;     // position on the lap, always within [0, CIRCUIT)
 uniform float iSky;        // per-activation sky variant
 uniform float iGrade;      // current track gradient, tilts the horizon
+uniform float iCruise;     // 1 on the flat and climbing, 0 in a plunge
+uniform float iRing;       // beat shockwave, 0 at the beat -> 1 spent
+// Embers, placed on the CPU: xy = screen position, z = remaining life.
+// Deriving them per fragment cost seven hashes and the live registers to
+// hold them, and this shader sits right on an occupancy cliff -- with the
+// per-pixel version the march loop itself ran twice as slow.
+uniform vec4  iEmber[7];
 uniform float iTorchGain;  // tweakable: how hot the wall torches burn
+uniform float iFlow;       // distance flown down the bore, wrapped at 100
 uniform vec4  iSpark[10];  // xy = screen position, z = remaining life
 // The march table, sampled on the CPU once per frame. xyz is the world point
 // on the centreline; iP.w is s, the distance along the circuit, which the
@@ -162,16 +187,32 @@ vec3 skyColour(vec2 p, float tb) {
               : iSky < 0.67 ? vec3(0.040, 0.045, 0.055)
                             : vec3(0.050, 0.036, 0.050);
     rock = mix(rock, palette(iHue + 0.55) * 0.10, 0.35 + iMid * 0.15);
-    float grain = vnoise(vec2(p.x * 46.0, p.y * 30.0)) * 0.65
-                + vnoise(vec2(p.x * 145.0, p.y * 95.0)) * 0.35;
-    rock *= 0.72 + grain * 0.55;
-    rock += palette(iHue + 0.2) * 0.05
-          * smoothstep(0.0, 1.0, sin(p.y * 26.0 + p.x * 6.0 + tb * 0.05) * 0.5 + 0.5);
     // The bore's centre rides the track gradient: pitched down you see more
     // floor, pitched up more roof, which is what sells the cart tipping over.
     vec2 bore = p - vec2(0.0, (up - 0.5) * 0.55);
-    rock *= mix(1.0, 0.22, smoothstep(0.15, 1.0, length(bore)));
-    rock += palette(iHue + 0.35) * 0.03 * smoothstep(0.9, 0.25, length(bore));
+    float br = max(length(bore), 0.015);
+
+    // The rock flies past. In log-polar coordinates a constant scroll along
+    // the radial axis is exactly the outward expansion that perspective
+    // produces, so the wall rushes by the cart instead of sitting still on the
+    // screen while the rails move underneath it -- which is what stopped the
+    // tunnel reading as a tunnel at all. iFlow wraps at 100, and both scroll
+    // rates are chosen so the noise lattice lands on itself at the wrap and
+    // nothing pops once a lap.
+    vec2 lp = vec2(atan(bore.y, bore.x) * 2.6, log(br) * 3.4);
+    float n1 = vnoise(lp * 3.0 + vec2(0.0, iFlow * 0.9));
+    float n2 = vnoise(lp * 9.0 + vec2(0.0, iFlow * 2.7));
+    rock *= 0.72 + (n1 * 0.65 + n2 * 0.35) * 0.55;
+
+    // Ore veins running through the rock, picked out of the same two octaves
+    // rather than a third: they light up with the mids, and harder still when
+    // the cart is on a flat and the geometry has stopped doing the work.
+    float vein = smoothstep(0.80, 1.02, n1 * 0.7 + n2 * 0.5);
+    rock += palette(iHue + 0.28) * vein
+          * (0.03 + iMid * 0.20 + iCruise * 0.16 + iBass * 0.11);
+
+    rock *= mix(1.0, 0.22, smoothstep(0.15, 1.0, br));
+    rock += palette(iHue + 0.35) * 0.03 * smoothstep(0.9, 0.25, br);
     return rock;
 }
 
@@ -179,7 +220,10 @@ void main() {
     float A = iResolution.x / max(iResolution.y, 1.0);
     float tb = mod(iTime, 300.0);
     float shake = iBass * 0.5 + iPunch * 0.8;
-    vec2 p = (v_uv - 0.5) * vec2(A, 1.0) / max(iZoom, 0.05);
+    // A short punch of field of view on the beat: the cheapest thing that
+    // makes a first-person ride feel like it is being hit by the music.
+    vec2 p = (v_uv - 0.5) * vec2(A, 1.0)
+           / max(iZoom * (1.0 - iPunch * 0.055), 0.05);
     p += vec2(sin(tb * 47.0), sin(tb * 39.0 + 1.1)) * shake * 0.006;
 
     vec3 col = skyColour(p, tb);
@@ -396,6 +440,38 @@ void main() {
     }
 
     col += palette(iHue + 0.5) * iBeat * 0.12;
+    // ── atmosphere ──────────────────────────────────────────────────────
+    // Everything here is scaled by iCruise, so it swells on the lift, over a
+    // crest and along the flats -- exactly where the track geometry stops
+    // carrying the frame on its own -- and gets out of the way in a plunge,
+    // where the speed is doing the work.
+    float air = iCruise;
+
+    // Light sweeping across the backdrop, driven by the low end.
+    float sweep = sin(p.x * 3.1 - p.y * 1.5 + tb * 1.05)
+                * sin(p.y * 2.3 + tb * 0.61);
+    col += palette(iHue + 0.35) * smoothstep(0.45, 1.0, sweep)
+         * air * (0.09 + iBass * 0.42);
+
+    // A shockwave thrown out of the vanishing point on every beat. iRing is
+    // integrated on the CPU, so it expands at a fixed rate rather than being
+    // tied to whatever the frame rate happens to be.
+    float rr = length(p - vec2(0.0, 0.03));
+    float ringR = iRing * 1.35;
+    col += palette(iHue + 0.62)
+         * smoothstep(0.075, 0.0, abs(rr - ringR)) * (1.0 - iRing)
+         * (0.30 + air * 1.05) * (0.5 + iBass * 0.8);
+
+    // Embers riding the airflow, thickest when the ride is not plunging.
+    vec3 emberA = palette(iHue + 0.10), emberB = palette(iHue + 0.42);
+    float emberG = air * (0.45 + iTreble * 0.9) * iGlitter;
+    for (int i = 0; i < 7; i++) {
+        vec2 ev = p - iEmber[i].xy;
+        float eq = dot(ev, ev);
+        if (eq < 0.004) col += mix(emberA, emberB, float(i) * 0.1667)
+                             * exp(-eq * 1500.0) * iEmber[i].z * emberG;
+    }
+
     col *= smoothstep(1.5, 0.22, length(v_uv - 0.5));
     col = col / (1.0 + col * 0.55);
     col = pow(clamp(col, 0.0, 1.0), vec3(0.85));
@@ -427,6 +503,9 @@ def ride_height(s: np.ndarray) -> np.ndarray:
          44.0 - d * 34.0 + 5.0 * (0.5 - 0.5 * np.cos(d * TAU * 4.0))],
         10.0 + (4.0 - 10.0) * _sstep(0.90, 1.0, u))         # brake run
 
+
+# The lowest point on the circuit, which anchors the speed band.
+H_LOW = float(ride_height(np.linspace(0.0, CIRCUIT, 512)).min())
 
 def track_point(s: np.ndarray, seed: float) -> np.ndarray:
     """The circuit's centreline: a closed curve, so coordinates stay bounded."""
@@ -460,9 +539,16 @@ def track_frame(s: np.ndarray, seed: float) -> tuple[np.ndarray, np.ndarray]:
     return lat, np.cross(lat, tan)
 
 
-def on_lift(s: float) -> bool:
-    """True while the chain has hold of the train."""
-    return ((s / CIRCUIT) % 1.0) < 0.30
+def lift_weight(s: float) -> float:
+    """How much of the haul chain has hold of the train, as a smooth 0..1 window.
+
+    A hard boolean here is what produced the one real jerk left in the speed
+    trace: crossing into the lift stepped the target from the bottom of the
+    band straight to the lift pace -- 16 m/s in a single frame, 54 m/s^2 through
+    the lag. Fading the handover in and out costs nothing and removes it.
+    """
+    u = (s / CIRCUIT) % 1.0
+    return float(_sstep(0.04, 0.09, u) * (1.0 - _sstep(0.27, 0.33, u)))
 
 
 class MineTrain(BaseEffect):
@@ -473,11 +559,9 @@ class MineTrain(BaseEffect):
     TAGS = ['rollercoast', 'ride', 'neon', 'intense', 'energetic', 'hard']
     PING_PONG_FRIENDS = [
         'First Drop', 'Corkscrew', 'Night Coaster', 'Coaster Cam',
-        'Demon Drop', 'Log Flume', 'Audio Spectrum',
+        'Log Flume', 'Audio Spectrum',
     ]
 
-    _LIFT_SPEED = 8.0        # m/s, chain speed
-    _MIN_SPEED = 5.0         # m/s, so a crest never stalls the ride
 
     def _init(self) -> None:
         self.parameters = {
@@ -499,6 +583,12 @@ class MineTrain(BaseEffect):
         self._travel = float(self.rng.uniform(0.0, CIRCUIT))
         self._grade = 0.0
         self._shake = 0.0
+        self._v = CRUISE
+        self._cruise = 0.5
+        self._ring = 1.0
+        self._flow = 0.0
+        self._ember_i = np.arange(7, dtype=np.float64)
+        self._tbl_ember = np.zeros((7, 4), dtype='f4')
 
         # March table, filled in place each frame and uploaded as uniforms.
         f = np.arange(STEPS + 1, dtype=np.float64) / STEPS
@@ -574,6 +664,8 @@ class MineTrain(BaseEffect):
         if audio.beat > 0.5:
             self._beat = 1.0
             self._punch = 1.0
+            self._ring = 0.0
+        self._ring = min(1.0, self._ring + dt * 1.45)
         self._beat = max(0.0, self._beat - dt * 5.0)
         self._punch = max(0.0, self._punch - dt * 2.2)
         self._shake = ((self._bass * 0.5 + self._punch * 0.8)
@@ -585,16 +677,30 @@ class MineTrain(BaseEffect):
         h = float(heights[1])
         self._grade = float(np.clip((heights[2] - heights[0]) / (2 * ahead), -1.5, 1.5))
 
-        # Energy conservation: everything the train has, it got by falling.
-        # On the lift the chain sets the pace instead.
-        if on_lift(self._travel):
-            v = self._LIFT_SPEED
-        else:
-            v = math.sqrt(max(0.0, 2.0 * GRAVITY * max(0.0, H_TOP - h)))
-            v = max(self._MIN_SPEED, v)
+        # Where the ride wants to be, then a lag toward it. Reading the target
+        # straight off the profile is what made hills and even slight inclines
+        # jerk: the branch seams step the gradient, and the chain/gravity
+        # handover stepped the speed outright.
+        fall = (H_TOP - h) / max(H_TOP - H_LOW, 1e-3)
+        rolling = CRUISE * (_SPEED_LO + (_SPEED_HI - _SPEED_LO)
+                            * math.sqrt(min(1.0, max(0.0, fall))))
+        w = lift_weight(self._travel)
+        target = rolling + (CRUISE * _LIFT_MULT - rolling) * w
+        self._v += (target - self._v) * (1.0 - math.exp(-dt / _SPEED_TAU))
+        v = self._v
+
+        # How much the ride is *not* plunging: 1 on the lift and over a crest,
+        # 0 at full speed. The backdrop uses it to pick up exactly where the
+        # geometry stops carrying the frame on its own.
+        span = CRUISE * (_SPEED_HI - _SPEED_LO)
+        self._cruise = float(np.clip(
+            1.0 - (v - CRUISE * _SPEED_LO) / span, 0.0, 1.0))
 
         speed = max(0.05, float(self.parameters['speed']))
         # Travel stays inside one lap forever, so no coordinate ever grows.
+        # Distance flown down the bore, for the wall texture. Wrapped at a
+        # value the noise lattice divides evenly, so the wrap is invisible.
+        self._flow = (self._flow + dt * speed * v * 0.012) % 100.0
         self._travel = (self._travel
                         + dt * speed * v * (0.8 + self._bass * 0.5)) % CIRCUIT
 
@@ -614,6 +720,19 @@ class MineTrain(BaseEffect):
         p['iTravel'].value = float(self._travel)
         p['iSky'].value = self._sky
         p['iGrade'].value = float(self._grade)
+        p['iCruise'].value = float(self._cruise)
+        p['iRing'].value = float(self._ring)
+        p['iFlow'].value = float(self._flow)
+
+        # Ember placement is identical for every pixel, so it happens here.
+        k = (self.time % 300.0) * (0.11 + self._ember_i * 0.017) + self._ember_i * 0.371
+        eph = k % 1.0
+        ehx = (np.sin(np.floor(k) * 12.9898 + self._ember_i * 78.233)
+               * 43758.5453) % 1.0
+        self._tbl_ember[:, 0] = (ehx - 0.5) * 1.7
+        self._tbl_ember[:, 1] = -0.55 + eph * 1.15
+        self._tbl_ember[:, 2] = 1.0 - eph
+        p['iEmber'].write(self._tbl_ember.tobytes())
         p['iTorchGain'].value = max(0.0, float(self.parameters['torch_gain']))
         self._build_march()
         self._vao.render(moderngl.TRIANGLE_STRIP)

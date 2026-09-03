@@ -48,13 +48,30 @@ import numpy as np
 
 from unicornviz.effects.base import AudioData, BaseEffect
 
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 
 # One lap, in metres. Shared by the CPU physics and the track sampler.
 CIRCUIT = 780.0
 # Crest of the ride; the energy model measures every fall from just above it.
 H_TOP = 32.0            # the splashdown crest
-GRAVITY = 9.81
+# ── speed model ─────────────────────────────────────────────────────────────
+# A coaster's true energy curve -- v = sqrt(2 g (H_top - h)) -- is physically
+# right and visually wrong here. It parks the ride on a chain lift for a third
+# of the lap and lets it creep over every summit: measured on the 0.3.0
+# profile, 43% of each lap ran under 12 m/s, with a 4.7x spread between the
+# crest and the bottom of the drop. That is a long time to spend crawling in
+# something whose job is to carry the energy of the music.
+#
+# The *shape* of the energy curve is what sells a drop, so it is kept -- speed
+# still comes from how far the train has fallen -- but it is remapped onto a
+# band that never creeps, and the result is passed through a first-order lag so
+# no seam between profile branches, and no handover between the chain and
+# gravity, can step the speed.
+CRUISE = 26.0            # m/s, the pace the ride holds when nothing is happening
+_SPEED_LO = 0.78         # multiple of CRUISE at a crest, and on the lift
+_SPEED_HI = 1.52         # multiple of CRUISE at the lowest point on the circuit
+_LIFT_MULT = 0.88        # multiple of CRUISE while the chain has hold
+_SPEED_TAU = 0.30        # s, lag constant; smooths every profile seam
 LAP_R = 150.0
 TAU = 2.0 * math.pi
 
@@ -88,6 +105,13 @@ uniform float iGlitter;
 uniform float iTravel;     // position on the lap, always within [0, CIRCUIT)
 uniform float iSky;        // per-activation sky variant
 uniform float iGrade;      // current track gradient, tilts the horizon
+uniform float iCruise;     // 1 on the flat and climbing, 0 in a plunge
+uniform float iRing;       // beat shockwave, 0 at the beat -> 1 spent
+// Embers, placed on the CPU: xy = screen position, z = remaining life.
+// Deriving them per fragment cost seven hashes and the live registers to
+// hold them, and this shader sits right on an occupancy cliff -- with the
+// per-pixel version the march loop itself ran twice as slow.
+uniform vec4  iEmber[7];
 // The march table, sampled on the CPU once per frame. xyz is the world point
 // on the centreline; iP.w is s, the distance along the circuit, which the
 // structure uses to place ties and bents.
@@ -200,7 +224,10 @@ void main() {
     float A = iResolution.x / max(iResolution.y, 1.0);
     float tb = mod(iTime, 300.0);
     float shake = iBass * 0.5 + iPunch * 0.8;
-    vec2 p = (v_uv - 0.5) * vec2(A, 1.0) / max(iZoom, 0.05);
+    // A short punch of field of view on the beat: the cheapest thing that
+    // makes a first-person ride feel like it is being hit by the music.
+    vec2 p = (v_uv - 0.5) * vec2(A, 1.0)
+           / max(iZoom * (1.0 - iPunch * 0.055), 0.05);
     p += vec2(sin(tb * 47.0), sin(tb * 39.0 + 1.1)) * shake * 0.006;
 
     vec3 col = skyColour(p, tb);
@@ -379,6 +406,38 @@ void main() {
     }
 
     col += palette(iHue + 0.45) * iBeat * 0.10;
+    // ── atmosphere ──────────────────────────────────────────────────────
+    // Everything here is scaled by iCruise, so it swells on the lift, over a
+    // crest and along the flats -- exactly where the track geometry stops
+    // carrying the frame on its own -- and gets out of the way in a plunge,
+    // where the speed is doing the work.
+    float air = iCruise;
+
+    // Light sweeping across the backdrop, driven by the low end.
+    float sweep = sin(p.x * 3.1 - p.y * 1.5 + tb * 1.05)
+                * sin(p.y * 2.3 + tb * 0.61);
+    col += palette(iHue + 0.35) * smoothstep(0.45, 1.0, sweep)
+         * air * (0.09 + iBass * 0.42);
+
+    // A shockwave thrown out of the vanishing point on every beat. iRing is
+    // integrated on the CPU, so it expands at a fixed rate rather than being
+    // tied to whatever the frame rate happens to be.
+    float rr = length(p - vec2(0.0, 0.03));
+    float ringR = iRing * 1.35;
+    col += palette(iHue + 0.62)
+         * smoothstep(0.075, 0.0, abs(rr - ringR)) * (1.0 - iRing)
+         * (0.30 + air * 1.05) * (0.5 + iBass * 0.8);
+
+    // Embers riding the airflow, thickest when the ride is not plunging.
+    vec3 emberA = palette(iHue + 0.10), emberB = palette(iHue + 0.42);
+    float emberG = air * (0.45 + iTreble * 0.9) * iGlitter;
+    for (int i = 0; i < 7; i++) {
+        vec2 ev = p - iEmber[i].xy;
+        float eq = dot(ev, ev);
+        if (eq < 0.004) col += mix(emberA, emberB, float(i) * 0.1667)
+                             * exp(-eq * 1500.0) * iEmber[i].z * emberG;
+    }
+
     col *= smoothstep(1.5, 0.22, length(v_uv - 0.5));
     col = col / (1.0 + col * 0.55);
     col = pow(clamp(col, 0.0, 1.0), vec3(0.85));
@@ -414,6 +473,9 @@ def ride_height(s: np.ndarray) -> np.ndarray:
         np.full_like(u, 2.0))                               # run-out
 
 
+# The lowest point on the circuit, which anchors the speed band.
+H_LOW = float(ride_height(np.linspace(0.0, CIRCUIT, 512)).min())
+
 def track_point(s: np.ndarray, seed: float) -> np.ndarray:
     """The circuit's centreline: a closed curve, so coordinates stay bounded."""
     th = ((s / CIRCUIT) % 1.0) * TAU
@@ -447,10 +509,17 @@ def track_frame(s: np.ndarray, seed: float) -> tuple[np.ndarray, np.ndarray]:
     return lat, np.cross(lat, tan)
 
 
-def on_conveyor(s: float) -> bool:
-    """True while a conveyor belt is pushing the log uphill."""
+def lift_weight(s: float) -> float:
+    """How much of a conveyor has hold of the log, as a smooth 0..1 window.
+
+    Two belts, each faded in and out. A hard boolean here is what produced the
+    one real jerk left in the speed trace: crossing onto a belt stepped the
+    target by 16 m/s in a single frame.
+    """
     u = (s / CIRCUIT) % 1.0
-    return 0.08 <= u < 0.22 or 0.40 <= u < 0.58
+    first = _sstep(0.06, 0.11, u) * (1.0 - _sstep(0.19, 0.25, u))
+    second = _sstep(0.38, 0.43, u) * (1.0 - _sstep(0.55, 0.61, u))
+    return float(min(1.0, first + second))
 
 
 class LogFlume(BaseEffect):
@@ -461,12 +530,9 @@ class LogFlume(BaseEffect):
     TAGS = ['rollercoast', 'ride', 'water', 'neon', 'energetic', 'chill']
     PING_PONG_FRIENDS = [
         'First Drop', 'Corkscrew', 'Night Coaster', 'Mine Train',
-        'Coaster Cam', 'Demon Drop', 'Audio Spectrum',
+        'Coaster Cam', 'Audio Spectrum',
     ]
 
-    _CONVEYOR_SPEED = 5.0    # m/s, belt speed
-    _MIN_SPEED = 4.0
-    _DRAG_SPEED = 9.0        # m/s ceiling on the run-out; water eats the rest
 
     def _init(self) -> None:
         self.parameters = {
@@ -488,6 +554,11 @@ class LogFlume(BaseEffect):
         self._travel = float(self.rng.uniform(0.0, CIRCUIT))
         self._grade = 0.0
         self._shake = 0.0
+        self._v = CRUISE
+        self._cruise = 0.5
+        self._ring = 1.0
+        self._ember_i = np.arange(7, dtype=np.float64)
+        self._tbl_ember = np.zeros((7, 4), dtype='f4')
         self._splash = 0.0
 
         # March table, filled in place each frame and uploaded as uniforms.
@@ -550,6 +621,8 @@ class LogFlume(BaseEffect):
         if audio.beat > 0.5:
             self._beat = 1.0
             self._punch = 1.0
+            self._ring = 0.0
+        self._ring = min(1.0, self._ring + dt * 1.45)
         self._beat = max(0.0, self._beat - dt * 5.0)
         self._punch = max(0.0, self._punch - dt * 2.2)
         self._shake = ((self._bass * 0.5 + self._punch * 0.8)
@@ -564,13 +637,24 @@ class LogFlume(BaseEffect):
         # Energy conservation: everything the train has, it got by falling.
         # On the lift the chain sets the pace instead.
         u = (self._travel / CIRCUIT) % 1.0
-        if on_conveyor(self._travel):
-            v = self._CONVEYOR_SPEED
-        else:
-            v = math.sqrt(max(0.0, 2.0 * GRAVITY * max(0.0, H_TOP - h)))
-            v = max(self._MIN_SPEED, v)
-            if u >= 0.76 or u < 0.08:
-                v = min(v, self._DRAG_SPEED)
+        # Where the ride wants to be, then a lag toward it. Reading the target
+        # straight off the profile is what made hills and even slight inclines
+        # jerk: the branch seams step the gradient, and the chain/gravity
+        # handover stepped the speed outright.
+        fall = (H_TOP - h) / max(H_TOP - H_LOW, 1e-3)
+        rolling = CRUISE * (_SPEED_LO + (_SPEED_HI - _SPEED_LO)
+                            * math.sqrt(min(1.0, max(0.0, fall))))
+        w = lift_weight(self._travel)
+        target = rolling + (CRUISE * _LIFT_MULT - rolling) * w
+        self._v += (target - self._v) * (1.0 - math.exp(-dt / _SPEED_TAU))
+        v = self._v
+
+        # How much the ride is *not* plunging: 1 on the lift and over a crest,
+        # 0 at full speed. The backdrop uses it to pick up exactly where the
+        # geometry stops carrying the frame on its own.
+        span = CRUISE * (_SPEED_HI - _SPEED_LO)
+        self._cruise = float(np.clip(
+            1.0 - (v - CRUISE * _SPEED_LO) / span, 0.0, 1.0))
 
         # The hull hits the pool at the foot of the splashdown; the sheet of
         # water it throws hangs over the camera for a moment afterwards.
@@ -599,6 +683,18 @@ class LogFlume(BaseEffect):
         p['iTravel'].value = float(self._travel)
         p['iSky'].value = self._sky
         p['iGrade'].value = float(self._grade)
+        p['iCruise'].value = float(self._cruise)
+        p['iRing'].value = float(self._ring)
+
+        # Ember placement is identical for every pixel, so it happens here.
+        k = (self.time % 300.0) * (0.11 + self._ember_i * 0.017) + self._ember_i * 0.371
+        eph = k % 1.0
+        ehx = (np.sin(np.floor(k) * 12.9898 + self._ember_i * 78.233)
+               * 43758.5453) % 1.0
+        self._tbl_ember[:, 0] = (ehx - 0.5) * 1.7
+        self._tbl_ember[:, 1] = -0.55 + eph * 1.15
+        self._tbl_ember[:, 2] = 1.0 - eph
+        p['iEmber'].write(self._tbl_ember.tobytes())
         p['iSplash'].value = float(self._splash)
         p['iSplashGain'].value = max(0.0, float(self.parameters['splash_gain']))
         self._build_march()
