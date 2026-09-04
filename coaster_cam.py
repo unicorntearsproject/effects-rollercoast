@@ -41,7 +41,7 @@ import numpy as np
 
 from unicornviz.effects.base import AudioData, BaseEffect
 
-__version__ = '0.4.0'
+__version__ = '0.4.1'
 
 # One lap, in metres. Shared by the CPU physics and the track sampler.
 CIRCUIT = 900.0
@@ -499,6 +499,12 @@ class CoasterCam(BaseEffect):
     ]
 
 
+    # Widest the view may go. This one already watches from outside the ride,
+    # so a wide field of view only shows more of the park rather than turning
+    # the track inside out the way it does on the first-person rides; it can be
+    # let out considerably further than they can.
+    _MIN_ZOOM = 0.50
+
     def _init(self) -> None:
         self.parameters = {
             'speed': float(self.config.get('speed', 1.0)),
@@ -656,7 +662,8 @@ class CoasterCam(BaseEffect):
         p['iBeat'].value = self._beat
         p['iPunch'].value = self._punch
         p['iHue'].value = self._hue
-        p['iZoom'].value = max(0.05, float(self.parameters['zoom']))
+        p['iZoom'].value = max(self._MIN_ZOOM,
+                               float(self.parameters['zoom']))
         p['iGlitter'].value = max(0.0, float(self.parameters['glitter']))
         p['iTravel'].value = float(self._travel)
         p['iSky'].value = self._sky

@@ -1,6 +1,6 @@
 # effects-rollercoast — Unicorn Viz effect pack
 
-**Version 0.4.0**
+**Version 0.4.1**
 
 Ride effects: First Drop, Corkscrew, Night Coaster, Mine Train, Coaster Cam,
 Log Flume.
@@ -65,6 +65,18 @@ Coaster), `torch_gain` (Mine Train), `cam_offset` (Coaster Cam), `splash_gain`
 (Log Flume).
 
 ## Changelog
+
+- **0.4.1** — capped how far each ride may zoom out. `zoom` divides the screen
+  coordinate, so it is a field of view control rather than a dolly: at 1.0 the
+  horizontal FOV is about 83 degrees and every step down widens it. The floor
+  was 0.05, which is roughly 174 degrees — wide enough that the near rails,
+  which run beside and below the rider, project out to the frame corners and
+  the shot reads as standing behind the track rather than riding it. Each ride
+  now declares `_MIN_ZOOM` (0.85 first-person, 0.50 for Coaster Cam, which
+  watches from outside and takes a wide view fine) and clamps whatever it is
+  handed. `config.toml` also bounds the app's zoom randomiser per ride, since
+  it otherwise rolls uniform(0.30, 1.80) and would land past the limit on its
+  own.
 
 - **0.4.0** — the rides no longer creep, and the backdrops pick up where the
   track stops carrying the frame.

@@ -54,7 +54,7 @@ import numpy as np
 
 from unicornviz.effects.base import AudioData, BaseEffect
 
-__version__ = '0.4.0'
+__version__ = '0.4.1'
 
 # One lap, in metres. Shared by the CPU physics and the track sampler.
 CIRCUIT = 900.0
@@ -492,6 +492,16 @@ class FirstDrop(BaseEffect):
     ]
 
 
+    # Widest the view may go. `zoom` divides the screen coordinate, so it is a
+    # field of view control rather than a dolly: at 1.0 the horizontal FOV is
+    # about 83 degrees, and every step down widens it. Below about 0.8 the
+    # rails -- which are right beside and below a rider -- project out to the
+    # frame corners, and the shot stops reading as riding the track and starts
+    # reading as standing behind it. Measured across the pack: 0.85 is the last
+    # value that still reads correctly, and the beat's field-of-view punch off
+    # this floor lands at 0.80, which is also clean.
+    _MIN_ZOOM = 0.85
+
     def _init(self) -> None:
         self.parameters = {
             'speed': float(self.config.get('speed', 1.0)),
@@ -626,7 +636,8 @@ class FirstDrop(BaseEffect):
         p['iBeat'].value = self._beat
         p['iPunch'].value = self._punch
         p['iHue'].value = self._hue
-        p['iZoom'].value = max(0.05, float(self.parameters['zoom']))
+        p['iZoom'].value = max(self._MIN_ZOOM,
+                               float(self.parameters['zoom']))
         p['iGlitter'].value = max(0.0, float(self.parameters['glitter']))
         p['iTravel'].value = float(self._travel)
         p['iSky'].value = self._sky
