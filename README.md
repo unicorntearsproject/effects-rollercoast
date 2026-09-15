@@ -1,6 +1,6 @@
 # effects-rollercoast — Unicorn Viz effect pack
 
-**Version 0.4.1**
+**Version 0.4.2**
 
 Ride effects: First Drop, Corkscrew, Night Coaster, Mine Train, Coaster Cam,
 Log Flume.
@@ -65,6 +65,14 @@ Coaster), `torch_gain` (Mine Train), `cam_offset` (Coaster Cam), `splash_gain`
 (Log Flume).
 
 ## Changelog
+
+- **0.4.2** — Log Flume framed four steps tighter. Its zoom floor goes 0.85 ->
+  1.25 (a zoom step is 0.10), and the default moves with it, because a floor
+  above the default clamps the default anyway and does it silently. The other
+  five rides are unchanged at 0.85 first-person / 0.50 chase: the flume is not
+  looser than its siblings, its channel is just open water with the scenery
+  set well back, so the field of view that frames a coaster's track reads as
+  standing much too far off here.
 
 - **0.4.1** — capped how far each ride may zoom out. `zoom` divides the screen
   coordinate, so it is a field of view control rather than a dolly: at 1.0 the

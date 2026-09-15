@@ -48,7 +48,7 @@ import numpy as np
 
 from unicornviz.effects.base import AudioData, BaseEffect
 
-__version__ = '0.4.1'
+__version__ = '0.4.2'
 
 # One lap, in metres. Shared by the CPU physics and the track sampler.
 CIRCUIT = 780.0
@@ -542,12 +542,17 @@ class LogFlume(BaseEffect):
     # reading as standing behind it. Measured across the pack: 0.85 is the last
     # value that still reads correctly, and the beat's field-of-view punch off
     # this floor lands at 0.80, which is also clean.
-    _MIN_ZOOM = 0.85
+    # Four steps (0.10 each) tighter than the other rides. The flume's
+    # channel is open water with the scenery set well back, so the same field
+    # of view that frames a coaster's track reads as standing much too far
+    # away here. The default moves with the floor -- a floor above the default
+    # would clamp it anyway, and silently.
+    _MIN_ZOOM = 1.25
 
     def _init(self) -> None:
         self.parameters = {
             'speed': float(self.config.get('speed', 1.0)),
-            'zoom': float(self.config.get('zoom', 1.0)),
+            'zoom': float(self.config.get('zoom', 1.25)),
             'reactivity': float(self.config.get('reactivity', 1.3)),
             'glitter': float(self.config.get('glitter', 1.0)),
             'splash_gain': float(self.config.get('splash_gain', 1.0)),

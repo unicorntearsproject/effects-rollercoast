@@ -54,7 +54,7 @@ import numpy as np
 
 from unicornviz.effects.base import AudioData, BaseEffect
 
-__version__ = '0.4.1'
+__version__ = '0.4.2'
 
 # One lap, in metres. Shared by the CPU physics and the track sampler.
 CIRCUIT = 900.0
