@@ -41,7 +41,7 @@ import numpy as np
 
 from unicornviz.effects.base import AudioData, BaseEffect
 
-__version__ = '0.4.2'
+__version__ = '0.5.0'
 
 # One lap, in metres. Shared by the CPU physics and the track sampler.
 CIRCUIT = 900.0
@@ -513,7 +513,12 @@ class CoasterCam(BaseEffect):
             'glitter': float(self.config.get('glitter', 1.0)),
             'cam_offset': float(self.config.get('cam_offset', 1.0)),
         }
-        self._prog = self._make_program(_VERT, _FRAG)
+        # March budget: the config editor's Effects tab pins 'march_steps';
+        # the shader bakes it in, so a change lands at the next activation.
+        self._steps = int(max(12, min(96, self.parameters.setdefault(
+            'march_steps', float(self.config.get('march_steps', STEPS))))))
+        self._prog = self._make_program(
+            _VERT, _FRAG.replace(f'#define STEPS {STEPS}', f'#define STEPS {self._steps}'))
         self._vao, self._vbo = self._fullscreen_quad(self._prog)
 
         self._bass = self._mid = self._treble = 0.0
@@ -532,16 +537,16 @@ class CoasterCam(BaseEffect):
         self._tbl_ember = np.zeros((7, 4), dtype='f4')
 
         # March table, filled in place each frame and uploaded as uniforms.
-        f = np.arange(STEPS + 1, dtype=np.float64) / STEPS
+        f = np.arange(self._steps + 1, dtype=np.float64) / self._steps
         self._march_f2 = f * f
         self._car_s = np.arange(8, dtype=np.float64) * -4.8 + 28.0
         self._tbl_car = np.zeros((8, 4), dtype='f4')
         self._tbl_carl = np.zeros((8, 4), dtype='f4')
         self._tbl_carn = np.zeros((8, 4), dtype='f4')
         self._side = 1.0 if self.rng.random() < 0.5 else -1.0
-        self._tbl_p = np.zeros((STEPS + 1, 4), dtype='f4')
-        self._tbl_l = np.zeros((STEPS + 1, 4), dtype='f4')
-        self._tbl_n = np.zeros((STEPS + 1, 4), dtype='f4')
+        self._tbl_p = np.zeros((self._steps + 1, 4), dtype='f4')
+        self._tbl_l = np.zeros((self._steps + 1, 4), dtype='f4')
+        self._tbl_n = np.zeros((self._steps + 1, 4), dtype='f4')
         self._probe = np.zeros(3, dtype=np.float64)
         self._build_march()
 
