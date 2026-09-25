@@ -54,7 +54,7 @@ import numpy as np
 
 from unicornviz.effects.base import AudioData, BaseEffect
 
-__version__ = '0.5.0'
+__version__ = '0.5.1'
 
 # One lap, in metres. Shared by the CPU physics and the track sampler.
 CIRCUIT = 900.0
@@ -503,6 +503,15 @@ class FirstDrop(BaseEffect):
     _MIN_ZOOM = 0.85
 
     def _init(self) -> None:
+        # The zoom randomizer's floor is this ride's own floor, so the ride
+        # supplies it. As a config key it had to equal _MIN_ZOOM by hand on
+        # six rides -- a key that can only ever be wrong -- and anything
+        # lower let the randomizer roll a zoom the ride then clamped, so the
+        # HUD reported a value that was never drawn. A higher configured
+        # value is still honored. Replaced, never mutated: self.config may be
+        # the loaded config's own table.
+        if float(self.config.get('random_zoom_min', 0.0)) < self._MIN_ZOOM:
+            self.config = {**self.config, 'random_zoom_min': self._MIN_ZOOM}
         self.parameters = {
             'speed': float(self.config.get('speed', 1.0)),
             'zoom': float(self.config.get('zoom', 1.0)),

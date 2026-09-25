@@ -1,6 +1,6 @@
 # effects-rollercoast — Unicorn Viz effect pack
 
-**Version 0.5.0**
+**Version 0.5.1**
 
 Ride effects: First Drop, Corkscrew, Night Coaster, Mine Train, Coaster Cam,
 Log Flume.
@@ -65,6 +65,14 @@ Coaster), `torch_gain` (Mine Train), `cam_offset` (Coaster Cam), `splash_gain`
 (Log Flume).
 
 ## Changelog
+
+- **0.5.1** — Each ride supplies its own zoom-randomizer floor. The app's
+  randomizer reads `random_zoom_min` off the live effect, and its own default
+  starts at 0.30, well past the point a track stops reading, so config.toml
+  had to repeat each ride's `_MIN_ZOOM` by hand on all six -- a key that can
+  only ever be wrong, and one with no home once config.toml is retired. The
+  ride now sets it to its own floor unless a higher value is configured, which
+  is still honored. No menu row is needed for it.
 
 - **0.5.0** — Every coaster's march budget is a `march_steps` parameter (12–96; defaults 46/40/30 per ride) on the config editor's Effects tab. The shader bakes it in, so a pinned value lands at the ride's next activation; `[effects.<Ride>] march_steps` seeds it.
 - **0.4.2** — Log Flume framed four steps tighter. Its zoom floor goes 0.85 ->
